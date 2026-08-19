@@ -466,6 +466,106 @@ class KimiK3RegistrationTests(unittest.TestCase):
         torch.testing.assert_close(gathered_hidden, torch.cat((hidden, hidden)))
         torch.testing.assert_close(gathered_prefix, torch.cat((prefix, prefix)))
 
+    def test_deepep_marlin_shards_routes_and_adds_prefix_after_tp_reduce(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+        layer = KimiLinearMoE.__new__(KimiLinearMoE)
+        torch.nn.Module.__init__(layer)
+        layer.mapping = SimpleNamespace(
+            attn=SimpleNamespace(
+                tp_size=2,
+                tp_rank=1,
+                tp_group=(0, 1),
+                dp_size=2,
+            )
+        )
+        layer.num_experts = 8
+        layer.routed_hidden = 2
+        layer.gate = lambda x: x.new_zeros((x.shape[0], layer.num_experts)).float()
+
+        class FakeTopK:
+            def __call__(self, hidden_states, router_logits):
+                return SimpleNamespace(
+                    hidden_states=hidden_states, logits=router_logits
+                )
+
+        layer.topk = FakeTopK()
+        layer.routed_expert_down_proj = SimpleNamespace(weight=torch.empty(0))
+        routed_inputs = []
+
+        class FakeExperts:
+            def __call__(self, *, hidden_states, overlap_fn, **kwargs):
+                routed_inputs.append((hidden_states.clone(), kwargs))
+                overlap_fn()
+                return hidden_states + 10
+
+        layer.experts = FakeExperts()
+        shared_inputs = []
+
+        def shared_experts(x):
+            shared_inputs.append(x.clone())
+            return torch.ones_like(x)
+
+        layer.shared_experts = shared_experts
+        gathered_latent = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+
+        class FakeUpProjection:
+            shard_slice = (2, 2)
+
+            @staticmethod
+            def project_shard(x):
+                return x + 100
+
+        layer.routed_expert_up_proj = FakeUpProjection()
+        layer.routed_expert_norm = None
+        hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        prefix = hidden + 1000
+        reduced_inputs = []
+
+        def gather(tensor, group, scattered_num_tokens):
+            self.assertEqual(group, (0, 1))
+            self.assertEqual(scattered_num_tokens, [3, 2])
+            torch.testing.assert_close(tensor, hidden[3:, :2] + 10)
+            return gathered_latent
+
+        def reduce(tensor, group):
+            self.assertEqual(group, (0, 1))
+            reduced_inputs.append(tensor.clone())
+            return tensor + 50
+
+        with (
+            mock.patch(
+                "tokenspeed.runtime.models.kimi_k3.decode_gemv",
+                side_effect=lambda x, weight: x[:, :2],
+            ),
+            mock.patch(
+                "tokenspeed.runtime.models.kimi_k3.token_all_gather",
+                side_effect=gather,
+            ),
+            mock.patch(
+                "tokenspeed.runtime.models.kimi_k3.all_reduce", side_effect=reduce
+            ),
+            mock.patch(
+                "tokenspeed.runtime.models.kimi_k3.use_deepep_low_latency",
+                return_value=False,
+            ),
+        ):
+            actual = layer._forward_deepep_marlin(
+                hidden,
+                prefix,
+                num_global_tokens=9,
+                max_num_tokens_per_gpu=3,
+                ctx=SimpleNamespace(),
+            )
+
+        torch.testing.assert_close(routed_inputs[0][0], hidden[3:, :2])
+        self.assertEqual(routed_inputs[0][1]["num_global_tokens"], 9)
+        torch.testing.assert_close(shared_inputs[0], hidden)
+        expected_tail_partial = torch.ones_like(hidden)
+        expected_tail_partial[:, 2:] += gathered_latent + 100
+        torch.testing.assert_close(reduced_inputs[0], expected_tail_partial)
+        torch.testing.assert_close(actual, prefix + expected_tail_partial + 50)
+
     def test_mla_gate_projection_uses_api_selected_layout(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
 

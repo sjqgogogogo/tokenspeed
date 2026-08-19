@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.communication.deep_ep import (
     DeepEPBuffer,
     DeepEPMode,
     _DeepEPDispatcherImplLowLatency,
+    _DeepEPDispatcherImplNormal,
 )
 
 
@@ -175,3 +176,37 @@ def test_low_latency_dispatch_requests_deepep_packed_ue8m0(
 
     assert seen["round_scale"] is ue8m0_scales
     assert seen["use_ue8m0"] is ue8m0_scales
+
+
+def test_normal_dispatch_forwards_backend_expert_alignment(monkeypatch) -> None:
+    seen = {}
+
+    class RecordingBuffer:
+        def get_dispatch_layout(self, *args, **kwargs):
+            return (None, None, None, None, None)
+
+        def dispatch(self, x, **kwargs):
+            seen.update(kwargs)
+            return x, kwargs["topk_idx"], kwargs["topk_weights"], [8], None, None
+
+    impl = _DeepEPDispatcherImplNormal(
+        async_finish=False,
+        group=None,
+        router_topk=4,
+        permute_fusion=True,
+        num_experts=64,
+        num_local_experts=16,
+        hidden_size=128,
+        params_dtype=torch.bfloat16,
+        deepep_mode=DeepEPMode.normal,
+        low_latency_max_num_tokens_per_gpu=256,
+        normal_expert_alignment=8,
+    )
+    monkeypatch.setattr(impl, "_get_buffer", RecordingBuffer)
+    x = torch.empty((1, 128), dtype=torch.bfloat16)
+    ids = torch.zeros((1, 4), dtype=torch.int64)
+    weights = torch.ones((1, 4), dtype=torch.float32)
+
+    impl._dispatch_core(x, ids, weights, previous_event=None)
+
+    assert seen["expert_alignment"] == 8

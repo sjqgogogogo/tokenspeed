@@ -310,6 +310,7 @@ class _DeepEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
         low_latency_max_num_tokens_per_gpu: int,
+        normal_expert_alignment: int = _FP8_BLOCK,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -319,6 +320,7 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.normal_expert_alignment = normal_expert_alignment
 
         self.params_bytes = 2
         self.num_max_dispatch_tokens_per_rank = low_latency_max_num_tokens_per_gpu
@@ -399,16 +401,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx = topk_idx.to(torch.int64)
         topk_weights = topk_weights.to(torch.float32)
         previous_event = Buffer.capture() if self.async_finish else None
-        return hidden_states, topk_idx, topk_weights, previous_event
+        return self._dispatch_core(
+            hidden_states, topk_idx, topk_weights, previous_event
+        )
 
-    def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        (
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            num_recv_tokens_per_expert_list,
-            event,
-        ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
+    def dispatch_b(
+        self,
+        hidden_states,
+        topk_idx,
+        topk_weights,
+        num_recv_tokens_per_expert_list,
+        event,
+    ):
         event.current_stream_wait() if self.async_finish else ()
 
         return (
@@ -472,7 +476,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             # Per-local-expert receive counts come back rounded up to this, so
             # the permuted buffer the grouped GEMM consumes is already tiled on
             # DeepGEMM's contiguous-layout block size.
-            expert_alignment=_FP8_BLOCK,
+            expert_alignment=self.normal_expert_alignment,
         )
 
         return (
@@ -742,6 +746,7 @@ class DeepEPDispatcher:
         return_recv_hook: bool = True,
         use_fp8: bool = False,
         ue8m0_scales: bool = False,
+        normal_expert_alignment: int = _FP8_BLOCK,
     ):
         """Own one MoE layer's DeepEP dispatch/combine legs.
 
@@ -756,6 +761,8 @@ class DeepEPDispatcher:
             use_fp8: Cast tokens to FP8 on the wire and return block scales.
             ue8m0_scales: Quantize with power-of-two scales, required when the
                 consuming GEMM reads scales as UE8M0 (sm100+ DeepGEMM).
+            normal_expert_alignment: Per-expert row alignment requested from
+                normal dispatch. Match this to the consuming grouped GEMM tile.
         """
         self.deepep_mode = deepep_mode
 
@@ -769,6 +776,7 @@ class DeepEPDispatcher:
             params_dtype=config.params_dtype,
             deepep_mode=deepep_mode,
             low_latency_max_num_tokens_per_gpu=config.low_latency_max_num_tokens_per_gpu,
+            normal_expert_alignment=normal_expert_alignment,
         )
 
         if self.deepep_mode.enable_low_latency():

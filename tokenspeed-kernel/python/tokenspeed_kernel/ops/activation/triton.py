@@ -486,6 +486,124 @@ def situ_and_mul(
     return out
 
 
+@triton.jit
+def _situ_and_mul_masked_kernel(
+    x_ptr,
+    out_ptr,
+    masked_m_ptr,
+    beta,
+    linear_beta,
+    hidden_dim: tl.constexpr,
+    x_stride_e,
+    x_stride_m,
+    out_stride_e,
+    out_stride_m,
+    ROW_SPLITS: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """SiTU over only the valid rows of an expert-major capacity buffer."""
+    pid = tl.program_id(0)
+    expert = tl.program_id(1)
+    col_block = pid // ROW_SPLITS
+    row = pid % ROW_SPLITS
+    cols = col_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    col_mask = cols < hidden_dim
+    valid_rows = tl.load(masked_m_ptr + expert)
+
+    while row < valid_rows:
+        gate_addrs = x_ptr + expert * x_stride_e + row * x_stride_m + cols
+        up_addrs = gate_addrs + hidden_dim
+        gate = tl.load(gate_addrs, mask=col_mask).to(tl.float32)
+        up = tl.load(up_addrs, mask=col_mask).to(tl.float32)
+        gate = beta * libdevice.tanh(gate / beta) * tl.sigmoid(gate)
+        if HAS_LINEAR_BETA:
+            up = linear_beta * libdevice.tanh(up / linear_beta)
+        tl.store(
+            out_ptr + expert * out_stride_e + row * out_stride_m + cols,
+            gate * up,
+            mask=col_mask,
+        )
+        row += ROW_SPLITS
+
+
+def _masked_situ_row_splits(capacity: int, expected_m: int | None) -> int:
+    """Bound SiTU row parallelism for sparse expert-major decode buffers."""
+    if expected_m is None:
+        return capacity
+    expected_m = int(expected_m)
+    if expected_m <= 0:
+        raise ValueError(f"expected_m must be positive, got {expected_m}")
+    target = max(2, min(expected_m, capacity) * 2)
+    return min(capacity, 1 << (target - 1).bit_length())
+
+
+def situ_and_mul_masked(
+    x: torch.Tensor,
+    masked_m: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    beta: float = 1.0,
+    linear_beta: float | None = None,
+    expected_m: int | None = None,
+) -> torch.Tensor:
+    """Apply SiTU to valid rows in a DeepEP expert-major capacity buffer.
+
+    ``x`` is ``[experts, capacity, 2 * D]`` and ``masked_m[e]`` is the number
+    of live rows for expert ``e``. Padded rows are deliberately left
+    uninitialized: the following masked/grouped expert GEMM and DeepEP combine
+    do not consume them. Sparse decode therefore scales with the received route
+    counts rather than the configured capacity.
+    """
+    if x.ndim != 3:
+        raise ValueError(f"x must be 3D, got {x.ndim}D")
+    if x.shape[-1] % 2:
+        raise ValueError(f"last dimension must be even, got {x.shape[-1]}")
+    if beta <= 0.0:
+        raise ValueError(f"beta must be positive, got {beta}")
+    if linear_beta is not None and linear_beta <= 0.0:
+        raise ValueError(f"linear_beta must be positive, got {linear_beta}")
+    num_experts, capacity, two_hidden = x.shape
+    if masked_m.shape != (num_experts,) or masked_m.dtype != torch.int32:
+        raise ValueError(
+            f"masked_m must be int32[{num_experts}], got "
+            f"dtype={masked_m.dtype}, shape={tuple(masked_m.shape)}"
+        )
+    hidden_dim = two_hidden // 2
+    output_shape = (num_experts, capacity, hidden_dim)
+    if out is None:
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+    elif tuple(out.shape) != output_shape:
+        raise ValueError(f"out shape must be {output_shape}, got {tuple(out.shape)}")
+    if out.dtype != x.dtype or out.device != x.device:
+        raise ValueError("out must have the same dtype and device as x")
+    if x.stride(-1) != 1 or out.stride(-1) != 1:
+        raise ValueError("x and out must have stride(-1) == 1")
+    if num_experts == 0 or capacity == 0 or hidden_dim == 0:
+        return out
+
+    row_splits = _masked_situ_row_splits(capacity, expected_m)
+    block_size = 256
+    grid = (row_splits * triton.cdiv(hidden_dim, block_size), num_experts)
+    _situ_and_mul_masked_kernel[grid](
+        x,
+        out,
+        masked_m,
+        float(beta),
+        1.0 if linear_beta is None else float(linear_beta),
+        hidden_dim=hidden_dim,
+        x_stride_e=x.stride(0),
+        x_stride_m=x.stride(1),
+        out_stride_e=out.stride(0),
+        out_stride_m=out.stride(1),
+        ROW_SPLITS=row_splits,
+        HAS_LINEAR_BETA=linear_beta is not None,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Fused SwiGLU + FP8 UE8M0 quantization
 # ---------------------------------------------------------------------------

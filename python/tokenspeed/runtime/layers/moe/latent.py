@@ -241,6 +241,7 @@ class Kimi3MoEExecutionPlan:
     overlap_shared_experts: bool
     joint_moe_reduce: bool
     use_marlin: bool = False
+    use_deepep_marlin: bool = False
     fused_moe_ar: bool = False
     lane_latent_norm_ar: bool = False
     comm_fusion_max_num_tokens: int = 0
@@ -257,6 +258,7 @@ class Kimi3MoEExecutionPlan:
         alt_stream: torch.cuda.Stream | None,
         *,
         enforce_eager: bool,
+        all2all_backend=None,
     ) -> "Kimi3MoEExecutionPlan":
         """Select orchestration without exposing platform policy to the model."""
 
@@ -275,10 +277,14 @@ class Kimi3MoEExecutionPlan:
             and not use_marlin
             and (moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm())
         )
+        use_deepep_marlin = bool(
+            use_marlin and all2all_backend is not None and all2all_backend.is_deepep()
+        )
         return cls(
             use_native=use_native,
             use_trtllm=use_trtllm,
             use_marlin=use_marlin,
+            use_deepep_marlin=use_deepep_marlin,
             overlap_shared_experts=(
                 use_native
                 and enforce_eager
@@ -378,8 +384,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
         ):
             # Chunked loads use full-weight row offsets, which sharded params cannot honor.
             raise ValueError(
-                "column-parallel Kimi3LatentProjection only supports whole-"
-                "tensor loads"
+                "column-parallel Kimi3LatentProjection only supports whole-tensor loads"
             )
         if self.shard_group is not None:
             rows = self.output_size_full // self.shard_size

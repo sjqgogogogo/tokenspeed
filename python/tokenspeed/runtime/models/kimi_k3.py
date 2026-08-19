@@ -139,7 +139,12 @@ from tokenspeed.runtime.layers.moe.latent import (
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import TopK, TopKOutput, TopKOutputFormat
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    get_moe_backend,
+    use_deepep_low_latency,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
@@ -231,15 +236,28 @@ class KimiLinearMLP(nn.Module):
         prefix: str = "",
         reduce_results: bool = True,
         is_shared_expert: bool = False,
+        shared_tp_rank: int | None = None,
+        shared_tp_size: int | None = None,
+        shared_tp_group: tuple[int, ...] | None = None,
         activation_situ_beta: float = 1.0,
         activation_situ_linear_beta: float | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
         if is_shared_expert:
-            tp_rank = mapping.moe.tp_ep_rank
-            tp_size = mapping.moe.tp_ep_size
-            tp_group = mapping.moe.tp_ep_group
+            if shared_tp_group is None:
+                tp_rank = mapping.moe.tp_ep_rank
+                tp_size = mapping.moe.tp_ep_size
+                tp_group = mapping.moe.tp_ep_group
+            else:
+                if shared_tp_rank is None or shared_tp_size is None:
+                    raise ValueError(
+                        "shared_tp_rank and shared_tp_size are required with "
+                        "shared_tp_group"
+                    )
+                tp_rank = shared_tp_rank
+                tp_size = shared_tp_size
+                tp_group = shared_tp_group
         else:
             tp_rank = mapping.dense.tp_rank
             tp_size = mapping.dense.tp_size
@@ -1088,11 +1106,13 @@ class KimiLinearMoE(nn.Module):
         situ_beta, situ_linear_beta = _situ_betas(config)
 
         moe_backend = get_moe_backend()
+        all2all_backend = get_all2all_backend()
         self.execution_plan = Kimi3MoEExecutionPlan.build(
             mapping,
             moe_backend,
             alt_stream,
             enforce_eager=bool(global_server_args_dict["enforce_eager"]),
+            all2all_backend=all2all_backend,
         )
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
@@ -1122,10 +1142,30 @@ class KimiLinearMoE(nn.Module):
             load_packaged_flashinfer_tuning_cache(
                 "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
             )
-        # Attention DP partitions the batch when its TP group is smaller than
-        # the MoE TP×EP group. Gather those DP shards so every rank enters the
-        # K3 MoE with the same complete token batch.
-        self._gather_dp_tokens_for_moe = mapping.attn.tp_size != mapping.moe.tp_ep_size
+        if all2all_backend.is_deepep() and not plan.use_deepep_marlin:
+            raise RuntimeError(
+                "Kimi-K3 DeepEP requires the Hopper Marlin MXFP4 backend. "
+                f"Selected MoE backend: {moe_backend.value!r}."
+            )
+        if plan.use_deepep_marlin and (
+            mapping.attn.cp_size != 1
+            or mapping.moe.dp_size != 1
+            or mapping.moe.tp_size != 1
+            or mapping.moe.ep_size != mapping.world_size
+            or mapping.attn.tp_size * mapping.attn.dp_size != mapping.world_size
+            or config.hidden_size % mapping.attn.tp_size != 0
+        ):
+            raise ValueError(
+                "Kimi-K3 DeepEP+Marlin requires attn CP=1, MoE TP=1, "
+                "MoE EP=WORLD, attn TP*DP=WORLD, and hidden_size divisible by "
+                "attention TP."
+            )
+        # The legacy TP/EP path gathers DP batches. DeepEP instead gives each
+        # TP rank one deterministic row shard and dispatches those unique rows.
+        self._gather_dp_tokens_for_moe = (
+            mapping.attn.tp_size != mapping.moe.tp_ep_size
+            and not plan.use_deepep_marlin
+        )
         if self._gather_dp_tokens_for_moe:
             if (
                 mapping.attn.cp_size != 1
@@ -1188,7 +1228,9 @@ class KimiLinearMoE(nn.Module):
             internal_activation_dtype_override=(
                 "input"
                 if self.execution_plan.use_native or self.execution_plan.use_marlin
-                else "fp8" if self.execution_plan.use_trtllm else None
+                else "fp8"
+                if self.execution_plan.use_trtllm
+                else None
             ),
         )
         if self.experts.support_routing:
@@ -1202,17 +1244,29 @@ class KimiLinearMoE(nn.Module):
             self.routed_hidden,
             prefix=add_prefix("routed_expert_down_proj", prefix),
         )
-        # AMD keeps replicated weights because Iris cannot use the folded AR→GEMM→AR order.
-        self._shard_up_projection = _shard_k3_up_projection(mapping, config.hidden_size)
+        # DeepEP restores routed latents inside each attention TP group, so its
+        # final projection is sharded over that node-local group rather than EP32.
+        self._shard_up_projection = (
+            True
+            if plan.use_deepep_marlin
+            else _shard_k3_up_projection(mapping, config.hidden_size)
+        )
+        up_shard_group = (
+            mapping.attn.tp_group if plan.use_deepep_marlin else mapping.moe.tp_ep_group
+        )
+        up_shard_rank = (
+            mapping.attn.tp_rank if plan.use_deepep_marlin else mapping.moe.tp_ep_rank
+        )
+        up_shard_size = (
+            mapping.attn.tp_size if plan.use_deepep_marlin else mapping.moe.tp_ep_size
+        )
         self.routed_expert_up_proj = Kimi3LatentProjection(
             self.routed_hidden,
             config.hidden_size,
             prefix=add_prefix("routed_expert_up_proj", prefix),
-            shard_group=(
-                mapping.moe.tp_ep_group if self._shard_up_projection else None
-            ),
-            shard_rank=mapping.moe.tp_ep_rank,
-            shard_size=mapping.moe.tp_ep_size,
+            shard_group=up_shard_group if self._shard_up_projection else None,
+            shard_rank=up_shard_rank,
+            shard_size=up_shard_size,
         )
         self.routed_expert_norm = (
             RMSNorm(self.routed_hidden, eps=config.rms_norm_eps)
@@ -1242,6 +1296,9 @@ class KimiLinearMoE(nn.Module):
             # stream after the aux-stream join, or in the joint Iris reduction.
             reduce_results=False,
             is_shared_expert=True,
+            shared_tp_rank=(mapping.attn.tp_rank if plan.use_deepep_marlin else None),
+            shared_tp_size=(mapping.attn.tp_size if plan.use_deepep_marlin else None),
+            shared_tp_group=(mapping.attn.tp_group if plan.use_deepep_marlin else None),
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
         )
@@ -1552,6 +1609,78 @@ class KimiLinearMoE(nn.Module):
             sum(dp_counts[: self.mapping.attn.dp_rank]),
         )
 
+    def _forward_deepep_marlin(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Dispatch one unique TP8 token shard to EP32 and finish locally.
+
+        Attention and shared experts retain the full DP-local batch. Only the
+        routed branch is row-sharded over attention TP, which removes duplicate
+        routing before DeepEP. Combine returns each shard to its source rank;
+        one node-local TP all-gather restores the routed latent, and one TP
+        all-reduce joins the shared and routed-up projection shards. Prefix is
+        added afterwards, so it is never multiplied by the reduction degree.
+        """
+        num_tokens, hidden_size = hidden_states.shape
+        token_counts = CommManager._scatter_count(num_tokens, self.mapping.attn.tp_size)
+        token_offset = sum(token_counts[: self.mapping.attn.tp_rank])
+        routed_count = token_counts[self.mapping.attn.tp_rank]
+        routed_source = hidden_states[token_offset : token_offset + routed_count]
+
+        if routed_count:
+            router_logits = self.gate(routed_source)
+            topk_output = self.topk(routed_source, router_logits)
+            routed_in = decode_gemv(routed_source, self.routed_expert_down_proj.weight)
+        else:
+            router_logits = torch.empty(
+                (0, self.num_experts), dtype=torch.float32, device=hidden_states.device
+            )
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device,
+                hidden_states=routed_source,
+                router_logits=router_logits,
+            )
+            routed_in = hidden_states.new_empty((0, self.routed_hidden))
+
+        shared_partial = None
+
+        def overlap_shared() -> None:
+            nonlocal shared_partial
+            shared_partial = self.shared_experts(hidden_states)
+
+        routed_shard = self.experts(
+            hidden_states=routed_in,
+            topk_output=topk_output,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            low_latency=use_deepep_low_latency(ctx, self.mapping.attn.dp_size),
+            overlap_fn=overlap_shared,
+        )
+        if shared_partial is None:
+            raise RuntimeError("DeepEP Marlin dispatch did not run shared overlap work")
+        if num_tokens == 0:
+            return prefix_sum
+
+        routed_latent = token_all_gather(
+            routed_shard,
+            group=self.mapping.attn.tp_group,
+            scattered_num_tokens=token_counts,
+        )
+        if self.routed_expert_norm is not None:
+            routed_latent = self.routed_expert_norm(routed_latent)
+        routed_projected_shard = self.routed_expert_up_proj.project_shard(routed_latent)
+        start, width = self.routed_expert_up_proj.shard_slice
+        tail_partial = shared_partial.view(num_tokens, hidden_size)
+        tail_partial[:, start : start + width] += routed_projected_shard
+        if self.mapping.attn.tp_size > 1:
+            tail_partial = all_reduce(tail_partial, self.mapping.attn.tp_group)
+        return prefix_sum + tail_partial
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1565,6 +1694,17 @@ class KimiLinearMoE(nn.Module):
         Returns the new prefix (``prefix_sum + routed + shared``); the tail
         tiers fuse the accumulate in-kernel.
         """
+        if self.execution_plan.use_deepep_marlin:
+            if ctx is None:
+                raise RuntimeError("Kimi-K3 DeepEP+Marlin requires a ForwardContext.")
+            return self._forward_deepep_marlin(
+                hidden_states,
+                prefix_sum,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                ctx,
+            )
+
         local_num_tokens = hidden_states.shape[0]
         local_offset = 0
         if self._gather_dp_tokens_for_moe:
@@ -1831,10 +1971,9 @@ class KimiLinearMoE(nn.Module):
         # One extra bf16 rounding vs the joined tiers; measured nil on GPQA, not bitwise.
         start, width = self.routed_expert_up_proj.shard_slice
         shared_partial = shared_partial.view(num_tokens, hidden_size)
-        shared_partial[
-            :, start : start + width
-        ] += routed_projected_shard + prefix_sum.view(num_tokens, hidden_size).narrow(
-            -1, start, width
+        shared_partial[:, start : start + width] += (
+            routed_projected_shard
+            + prefix_sum.view(num_tokens, hidden_size).narrow(-1, start, width)
         )
         return shared_partial
 
@@ -2357,6 +2496,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 prefix_sum,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                ctx=ctx,
             )
         else:
             prefix_sum = prefix_sum + self.mlp(h)

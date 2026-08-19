@@ -31,6 +31,7 @@ import pytest
 import torch
 from kimi3_reference import a16w4_mxfp4_moe_reference
 from tokenspeed_kernel.ops.moe.marlin.mxfp4 import (
+    _masked_marlin_schedule,
     marlin_mxfp4_moe_weights,
     marlin_mxfp4_precomputed_moe_apply,
 )
@@ -45,6 +46,22 @@ def _requires_sm90():
         pytest.skip("NVIDIA required")
     if current_platform().arch_version < type(current_platform().arch_version)(9, 0):
         pytest.skip("SM90+ required")
+
+
+def test_masked_marlin_schedule_uses_only_counted_routes() -> None:
+    _requires_sm90()
+    counts = torch.tensor([0, 1, 9], dtype=torch.int32, device="cuda")
+
+    sorted_ids, expert_ids, num_padded = _masked_marlin_schedule(
+        counts, capacity=16, block_m=8
+    )
+
+    assert int(num_padded.item()) == 24
+    assert expert_ids[:3].tolist() == [1, 2, 2]
+    sentinel = 3 * 16
+    assert sorted_ids[:8].tolist() == [16] + [sentinel] * 7
+    assert sorted_ids[8:16].tolist() == list(range(32, 40))
+    assert sorted_ids[16:24].tolist() == [40] + [sentinel] * 7
 
 
 class _Weights(torch.nn.Module):

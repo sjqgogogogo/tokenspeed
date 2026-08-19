@@ -7,6 +7,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     sigmoid_mul,
     silu_and_mul,
     situ_and_mul,
+    situ_and_mul_masked,
     swiglu_oai,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -221,6 +222,34 @@ def test_situ_and_mul_rejects_invalid_beta(device: str) -> None:
     x = torch.randn(1, 64, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="beta must be positive"):
         situ_and_mul(x, beta=0.0)
+
+
+def test_situ_and_mul_masked_skips_capacity_rows(device: str) -> None:
+    experts, capacity, hidden = 3, 7, 32
+    x = torch.randn(experts, capacity, 2 * hidden, device=device, dtype=torch.bfloat16)
+    masked_m = torch.tensor([0, 3, 7], dtype=torch.int32, device=device)
+    out = torch.full(
+        (experts, capacity, hidden),
+        float("nan"),
+        dtype=x.dtype,
+        device=device,
+    )
+
+    situ_and_mul_masked(
+        x,
+        masked_m,
+        out=out,
+        beta=4.0,
+        linear_beta=25.0,
+        expected_m=2,
+    )
+
+    expected = _situ_reference(x, 4.0, 25.0)
+    for expert, count in enumerate(masked_m.tolist()):
+        torch.testing.assert_close(
+            out[expert, :count], expected[expert, :count], atol=1e-2, rtol=1e-2
+        )
+        assert bool(torch.isnan(out[expert, count:]).all())
 
 
 # --- fused_gate_sigmoid_mul_add tests ---
