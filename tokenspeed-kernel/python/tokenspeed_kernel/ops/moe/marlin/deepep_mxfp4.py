@@ -210,14 +210,12 @@ def _apply_low_latency(
         ),
     )
 
-    # The low-latency combine leg applies the routing weights itself. This
-    # deep_ep tree's LL combine carries an identity-expert extension (-1 ids
-    # add x_ori * weight) and device-asserts x_ori whenever any weight is
-    # nonzero; all our ids are valid so x is never actually read, but the
-    # pointer must be supplied.
-    dispatcher.combine_a(
-        expert_out, topk_ids, topk_weights, low_latency=True, moe_origin_input=x
-    )
+    # The low-latency combine leg applies the routing weights itself. K3 routes
+    # every slot to a real expert, so it does not use the fork-specific
+    # identity-expert extension that takes the original tokens as ``x_ori``.
+    # Keep this call on DeepEP's public low-latency API, including the
+    # K3-capable 142bb5e build, which has no ``x_ori`` keyword.
+    dispatcher.combine_a(expert_out, topk_ids, topk_weights, low_latency=True)
     return dispatcher.combine_b()
 
 
