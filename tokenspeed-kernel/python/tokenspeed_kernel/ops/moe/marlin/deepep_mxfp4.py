@@ -32,15 +32,14 @@ FP8 activation form to exploit), so dispatch carries a single bf16 tensor.
 
 Both DeepEP modes are supported, and their receive layouts differ:
 
-- Normal (extend-shaped): flat rows with global ``topk_ids`` whose non-local
-  slots arrive as -1; the Marlin apply's global->local remap handles that
-  layout as-is, and the route weights fold into GEMM2 so combine reduces
-  unweighted.
+- Normal (extend-shaped): flat rows with rank-local ``topk_ids`` whose
+  non-local slots arrive as -1. Marlin consumes those ids directly, and the
+  route weights fold into GEMM2 so combine reduces unweighted.
 - Low-latency (decode-shaped): a padded per-expert buffer
   ``[num_local_experts, recv_m, hidden]`` with ``masked_m`` valid rows per
-  expert and no ids. Each row belongs to exactly one local expert, so the
-  apply flattens the buffer and synthesizes a top-1 routing (weight 1.0);
-  the real route weights are applied by the low-latency combine leg.
+  expert and no ids. A device-side count-driven Marlin schedule covers only
+  valid rows; the real route weights are applied by the low-latency combine
+  leg.
 
 Intranode traffic runs the NVLink P2P fast path in both modes; the IBGDA
 requirement only bites for internode low-latency traffic.
@@ -54,9 +53,10 @@ from types import SimpleNamespace
 import torch
 from tokenspeed_kernel.ops.communication.deep_ep import DeepEPDispatcher, DeepEPMode
 from tokenspeed_kernel.ops.moe.marlin.mxfp4 import (
+    MARLIN_M_BLOCK,
     MXFP4_BLOCK,
+    _marlin_mxfp4_local_apply,
     marlin_mxfp4_moe_weights,
-    marlin_mxfp4_precomputed_moe_apply,
 )
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -99,11 +99,12 @@ def _get_dispatcher(
     dispatcher = DeepEPDispatcher(
         config,
         deepep_mode=deepep_mode,
-        async_finish=False,
+        async_finish=True,
         return_recv_hook=True,
         # bf16 on the wire: Marlin consumes bf16 activations directly, so the
         # FP8 wire cast of the DeepGEMM path would only add quantization error.
         use_fp8=False,
+        normal_expert_alignment=MARLIN_M_BLOCK,
     )
     plan["_deepep_dispatcher"] = dispatcher
     return dispatcher
@@ -119,7 +120,7 @@ def _apply_normal(
     enable_pdl: bool,
     overlap_fn: Callable[[], None] | None,
 ) -> torch.Tensor:
-    """Extend-shaped path: flat recv rows, global ids with -1 masking."""
+    """Extend-shaped path: compact rows and rank-local ids from DeepEP."""
     dispatcher.dispatch_a(x, topk_ids, topk_weights, low_latency=False)
     # Normal-mode dispatch finishes asynchronously; work queued here overlaps
     # the transfer instead of waiting behind it.
@@ -136,17 +137,16 @@ def _apply_normal(
     ) = dispatcher.dispatch_b()
 
     if recv_x.shape[0]:
-        # Local experts' contribution per received token. Non-local ids arrive
-        # as -1 and fall into the Marlin EP mask (zero contribution); the
-        # route weights are folded in by GEMM2, so combine reduces unweighted.
-        expert_out = marlin_mxfp4_precomputed_moe_apply(
+        # DeepEP has already converted surviving routes to local expert ids;
+        # avoid rebuilding a global-to-local mapping for every layer. Slots for
+        # experts on other ranks remain -1 and the EP schedule skips them.
+        expert_out = _marlin_mxfp4_local_apply(
             plan,
             recv_x,
             w,
-            None,
-            topk_weights=recv_topk_weights,
-            topk_ids=recv_topk_ids,
-            enable_pdl=enable_pdl,
+            recv_topk_ids,
+            recv_topk_weights,
+            is_ep=True,
         )
     else:
         expert_out = torch.zeros_like(recv_x)
@@ -166,6 +166,7 @@ def _apply_low_latency(
     topk_ids: torch.Tensor,
     enable_pdl: bool,
     overlap_fn: Callable[[], None] | None,
+    num_tokens_global: int | None,
 ) -> torch.Tensor:
     """Decode-shaped path: padded per-expert recv buffer, masked rows.
 
@@ -183,38 +184,31 @@ def _apply_low_latency(
         overlap_fn()
     recv_x, _, _, _, _, _, masked_m = dispatcher.dispatch_b()
 
-    num_local_experts, recv_m, hidden = recv_x.shape
-    ep_rank = int(getattr(w, "ep_rank", 0))
-    expert_start = ep_rank * num_local_experts
-    device = recv_x.device
-
-    # Row r of expert e is valid iff r < masked_m[e]; valid rows route to the
-    # (global) id of their owning expert, padded rows to -1. All device-side,
-    # no sync on masked_m.
-    global_ids = torch.arange(
-        expert_start,
-        expert_start + num_local_experts,
-        dtype=torch.int32,
-        device=device,
+    num_local_experts, recv_m, _ = recv_x.shape
+    # The low-latency combine leg owns the original routing weights. Marlin
+    # needs only a correctly typed placeholder while its device-side schedule
+    # is built straight from masked_m and skips the capacity tail.
+    local_weights = torch.empty(
+        (num_local_experts * recv_m, 1),
+        dtype=torch.float32,
+        device=recv_x.device,
     )
-    valid = torch.arange(recv_m, dtype=torch.int32, device=device).unsqueeze(
-        0
-    ) < masked_m.to(torch.int32).unsqueeze(1)
-    flat_ids = torch.where(valid, global_ids.unsqueeze(1).expand(-1, recv_m), -1)
-    flat_ids = flat_ids.reshape(-1, 1)
-    flat_weights = torch.ones(
-        (num_local_experts * recv_m, 1), dtype=torch.float32, device=device
-    )
-
-    expert_out = marlin_mxfp4_precomputed_moe_apply(
+    expert_out = _marlin_mxfp4_local_apply(
         plan,
-        recv_x.reshape(num_local_experts * recv_m, hidden),
+        recv_x,
         w,
         None,
-        topk_weights=flat_weights,
-        topk_ids=flat_ids,
-        enable_pdl=enable_pdl,
-    ).view(num_local_experts, recv_m, hidden)
+        local_weights,
+        is_ep=False,
+        masked_m=masked_m,
+        expected_m=_deepep_expected_m(
+            x,
+            w,
+            topk_ids.shape[1],
+            num_tokens_global,
+            recv_m,
+        ),
+    )
 
     # The low-latency combine leg applies the routing weights itself. This
     # deep_ep tree's LL combine carries an identity-expert extension (-1 ids
@@ -225,6 +219,23 @@ def _apply_low_latency(
         expert_out, topk_ids, topk_weights, low_latency=True, moe_origin_input=x
     )
     return dispatcher.combine_b()
+
+
+def _deepep_expected_m(
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    top_k: int,
+    num_tokens_global: int | None,
+    recv_m: int,
+) -> int:
+    """Estimate live rows/expert to tune sparse masked SiTU parallelism."""
+    num_experts = int(getattr(w, "num_experts", 0) or 0)
+    if num_experts <= 0:
+        return recv_m
+    ep_size = int(getattr(w, "ep_size", 1) or 1)
+    total_tokens = int(num_tokens_global or x.shape[0] * ep_size)
+    expected = (total_tokens * top_k + num_experts - 1) // num_experts
+    return max(1, min(expected, recv_m))
 
 
 @register_kernel(
@@ -240,7 +251,7 @@ def _apply_low_latency(
     signatures=format_signatures("x", "dense", {torch.bfloat16}),
     traits={
         "weight_dtype": frozenset({"mxfp4"}),
-        "activation": frozenset({"silu", "situ", "swiglu"}),
+        "activation": frozenset({"situ"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({True}),
@@ -277,10 +288,11 @@ def marlin_mxfp4_deepep_moe_apply(
         router_logits: Unused; routing is precomputed.
         topk_weights: ``[local_tokens, top_k]`` route weights.
         topk_ids: ``[local_tokens, top_k]`` global expert ids.
-        num_tokens_global: Unused; DeepEP owns the token exchange.
+        num_tokens_global: Unique source-token count, used to tune sparse
+            low-latency SiTU scheduling.
         max_num_tokens_per_gpu: Unused capacity hint.
         do_finalize: Must be true (combine is the finalize).
-        enable_pdl: Forwarded to the Marlin apply's activation epilogue.
+        enable_pdl: Reserved for Marlin launch compatibility.
         low_latency: Which DeepEP legs to run when the plan mode is "auto".
             Every rank of the EP group must pass the same value.
         overlap_fn: Optional work queued inside the dispatch window (e.g. the
@@ -291,7 +303,7 @@ def marlin_mxfp4_deepep_moe_apply(
         ``[local_tokens, hidden]`` bf16 combined MoE output, already reduced
         across the EP group (no outer all-reduce needed).
     """
-    del router_logits, num_tokens_global, max_num_tokens_per_gpu
+    del router_logits, max_num_tokens_per_gpu
     if not do_finalize:
         raise ValueError("Marlin MXFP4 DeepEP MoE cannot defer finalization")
     if topk_weights is None or topk_ids is None:
@@ -306,5 +318,13 @@ def marlin_mxfp4_deepep_moe_apply(
             dispatcher, plan, x, w, topk_weights, topk_ids, enable_pdl, overlap_fn
         )
     return _apply_low_latency(
-        dispatcher, plan, x, w, topk_weights, topk_ids, enable_pdl, overlap_fn
+        dispatcher,
+        plan,
+        x,
+        w,
+        topk_weights,
+        topk_ids,
+        enable_pdl,
+        overlap_fn,
+        num_tokens_global,
     )

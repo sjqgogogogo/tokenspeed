@@ -255,6 +255,45 @@ class KimiK3RegistrationTests(unittest.TestCase):
             out=down_out,
         )
 
+    def test_shared_experts_can_shard_on_attention_tp(self):
+        import tokenspeed.runtime.models.kimi_k3 as kimi_k3
+
+        calls = []
+
+        class FakeLinear(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                calls.append(kwargs)
+
+        mapping = SimpleNamespace(
+            moe=SimpleNamespace(
+                tp_ep_rank=9,
+                tp_ep_size=32,
+                tp_ep_group=tuple(range(32)),
+            )
+        )
+        attn_group = tuple(range(8, 16))
+        with (
+            mock.patch.object(kimi_k3, "MergedColumnParallelLinear", FakeLinear),
+            mock.patch.object(kimi_k3, "RowParallelLinear", FakeLinear),
+        ):
+            kimi_k3.KimiLinearMLP(
+                hidden_size=64,
+                intermediate_size=32,
+                mapping=mapping,
+                reduce_results=False,
+                is_shared_expert=True,
+                shared_tp_rank=1,
+                shared_tp_size=8,
+                shared_tp_group=attn_group,
+            )
+
+        self.assertEqual(len(calls), 2)
+        for kwargs in calls:
+            self.assertEqual(kwargs["tp_rank"], 1)
+            self.assertEqual(kwargs["tp_size"], 8)
+            self.assertEqual(kwargs["tp_group"], attn_group)
+
     def test_kda_stacks_qkvfab_projection_weights(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
 
@@ -535,6 +574,184 @@ class KimiK3RegistrationTests(unittest.TestCase):
             self.assertEqual(counts, [3, 5, 7, 11])
         torch.testing.assert_close(gathered_hidden, torch.cat((hidden, hidden)))
         torch.testing.assert_close(gathered_prefix, torch.cat((prefix, prefix)))
+
+    def test_deepep_topology_is_pipeline_stage_aware(self):
+        from tokenspeed.runtime.models.kimi_k3 import (
+            _validate_k3_deepep_topology,
+        )
+
+        mapping = SimpleNamespace(
+            stage_world_size=8,
+            pp_rank=2,
+            attn=SimpleNamespace(cp_size=1, tp_size=2, dp_size=4),
+            moe=SimpleNamespace(
+                dp_size=1,
+                tp_size=1,
+                ep_size=8,
+                ep_group=tuple(range(16, 24)),
+            ),
+        )
+
+        _validate_k3_deepep_topology(
+            mapping,
+            hidden_size=64,
+            num_experts=16,
+        )
+
+        mapping.moe.ep_size = 32
+        mapping.moe.ep_group = tuple(range(32))
+        with self.assertRaisesRegex(ValueError, "expected stage size 8"):
+            _validate_k3_deepep_topology(
+                mapping,
+                hidden_size=64,
+                num_experts=32,
+            )
+
+    def test_deepep_row_shards_cover_tokens_once_with_zero_rank_rows(self):
+        from tokenspeed.runtime.distributed.comm_manager import CommManager
+
+        counts = CommManager._scatter_count(3, 8)
+        self.assertEqual(counts, [1, 1, 1, 0, 0, 0, 0, 0])
+        offsets = [sum(counts[:rank]) for rank in range(8)]
+        rows = [
+            row
+            for rank, count in enumerate(counts)
+            for row in range(offsets[rank], offsets[rank] + count)
+        ]
+        self.assertEqual(rows, [0, 1, 2])
+
+    def test_deepep_marlin_shards_routes_and_adds_prefix_after_tp_reduce(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+        layer = KimiLinearMoE.__new__(KimiLinearMoE)
+        torch.nn.Module.__init__(layer)
+        layer.mapping = SimpleNamespace(
+            attn=SimpleNamespace(
+                tp_size=2,
+                tp_rank=1,
+                tp_group=(0, 1),
+                dp_size=2,
+            )
+        )
+        layer.num_experts = 8
+        layer.routed_hidden = 2
+        layer.gate = lambda x: x.new_zeros((x.shape[0], layer.num_experts)).float()
+
+        class FakeTopK:
+            def __call__(self, hidden_states, router_logits):
+                return SimpleNamespace(
+                    hidden_states=hidden_states,
+                    logits=router_logits,
+                )
+
+        layer.topk = FakeTopK()
+
+        class FakeDownProjection:
+            @staticmethod
+            def __call__(x):
+                return x[:, :2], None
+
+        layer.routed_expert_down_proj = FakeDownProjection()
+        routed_inputs = []
+
+        class FakeExperts:
+            def __call__(self, *, hidden_states, overlap_fn, **kwargs):
+                routed_inputs.append((hidden_states.clone(), kwargs))
+                overlap_fn()
+                return hidden_states + 10
+
+        layer.experts = FakeExperts()
+        shared_inputs = []
+
+        def shared_experts(x):
+            shared_inputs.append(x.clone())
+            return torch.ones_like(x)
+
+        layer.shared_experts = shared_experts
+        gathered_latent = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+
+        class FakeUpProjection:
+            shard_slice = (2, 2)
+
+            @staticmethod
+            def project_shard(x):
+                return x + 100
+
+        layer.routed_expert_up_proj = FakeUpProjection()
+        layer.routed_expert_norm = None
+        hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        prefix = hidden + 1000
+        reduced_inputs = []
+
+        def gather(tensor, group, scattered_num_tokens):
+            self.assertEqual(group, (0, 1))
+            self.assertEqual(scattered_num_tokens, [3, 2])
+            torch.testing.assert_close(tensor, hidden[3:, :2] + 10)
+            return gathered_latent
+
+        def reduce(tensor, group):
+            self.assertEqual(group, (0, 1))
+            reduced_inputs.append(tensor.clone())
+            return tensor + 50
+
+        with (
+            mock.patch(
+                "tokenspeed.runtime.models.kimi_k3.token_all_gather",
+                side_effect=gather,
+            ),
+            mock.patch(
+                "tokenspeed.runtime.models.kimi_k3.all_reduce",
+                side_effect=reduce,
+            ),
+            mock.patch(
+                "tokenspeed.runtime.models.kimi_k3.use_deepep_low_latency",
+                return_value=False,
+            ),
+        ):
+            actual = layer._forward_deepep_marlin(
+                hidden,
+                prefix,
+                num_global_tokens=9,
+                max_num_tokens_per_gpu=3,
+                ctx=SimpleNamespace(),
+            )
+
+        torch.testing.assert_close(routed_inputs[0][0], hidden[3:, :2])
+        self.assertEqual(routed_inputs[0][1]["num_global_tokens"], 9)
+        self.assertFalse(routed_inputs[0][1]["low_latency"])
+        torch.testing.assert_close(shared_inputs[0], hidden)
+        expected_tail_partial = torch.ones_like(hidden)
+        expected_tail_partial[:, 2:] += gathered_latent + 100
+        torch.testing.assert_close(reduced_inputs[0], expected_tail_partial)
+        torch.testing.assert_close(actual, prefix + expected_tail_partial + 50)
+
+    def test_deepep_forward_bypasses_legacy_gather_and_tail(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+        layer = KimiLinearMoE.__new__(KimiLinearMoE)
+        torch.nn.Module.__init__(layer)
+        layer.execution_plan = SimpleNamespace(use_deepep_marlin=True)
+        layer._gather_dp_tokens_for_moe = True
+        expected = torch.ones(2, 4)
+        layer._forward_deepep_marlin = mock.Mock(return_value=expected)
+        layer._gather_dp_tokens = mock.Mock(
+            side_effect=AssertionError("legacy gather must not run")
+        )
+        layer.comm = mock.Mock()
+        hidden = torch.zeros(2, 4)
+        prefix = torch.zeros_like(hidden)
+
+        actual = layer(
+            hidden,
+            prefix,
+            num_global_tokens=2,
+            max_num_tokens_per_gpu=2,
+            ctx=SimpleNamespace(),
+        )
+
+        self.assertIs(actual, expected)
+        layer._gather_dp_tokens.assert_not_called()
+        layer.comm.plan.assert_not_called()
 
     def test_mla_gate_projection_uses_api_selected_layout(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention

@@ -34,7 +34,8 @@ lives in ``thirdparty/cuda/csrc/marlin_moe`` and is pre-compiled.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.activation.triton import situ_and_mul
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.activation.triton import situ_and_mul, situ_and_mul_masked
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -48,6 +49,70 @@ from tokenspeed_kernel.thirdparty.cuda.marlin_moe import (
 )
 
 MXFP4_BLOCK = 32
+MARLIN_M_BLOCK = 8
+
+
+@triton.jit
+def _masked_marlin_schedule_kernel(
+    masked_m_ptr,
+    block_offsets_ptr,
+    sorted_ids_ptr,
+    expert_ids_ptr,
+    capacity: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Build Marlin's padded route schedule directly from DeepEP counts."""
+    expert = tl.program_id(0)
+    valid_rows = tl.load(masked_m_ptr + expert)
+    block_offset = tl.load(block_offsets_ptr + expert)
+    num_blocks = (valid_rows + BLOCK_M - 1) // BLOCK_M
+    cols = tl.arange(0, BLOCK_M)
+    block = 0
+    while block < num_blocks:
+        row = block * BLOCK_M + cols
+        output_block = block_offset + block
+        route = expert * capacity + row
+        route = tl.where(row < valid_rows, route, tl.num_programs(0) * capacity)
+        tl.store(sorted_ids_ptr + output_block * BLOCK_M + cols, route)
+        tl.store(expert_ids_ptr + output_block, expert)
+        block += 1
+
+
+def _masked_marlin_schedule(
+    masked_m: torch.Tensor,
+    capacity: int,
+    block_m: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create a count-driven schedule without materializing capacity routes."""
+    num_experts = masked_m.shape[0]
+    block_counts = torch.div(
+        masked_m + block_m - 1,
+        block_m,
+        rounding_mode="floor",
+    )
+    block_ends = torch.cumsum(block_counts, dim=0, dtype=torch.int32)
+    block_offsets = block_ends - block_counts
+    max_blocks = num_experts * ((capacity + block_m - 1) // block_m)
+    sorted_ids = torch.empty(
+        max_blocks * block_m, dtype=torch.int32, device=masked_m.device
+    )
+    expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=masked_m.device)
+    num_tokens_post_padded = (
+        block_ends[-1:].mul(block_m)
+        if num_experts
+        else torch.zeros(1, dtype=torch.int32, device=masked_m.device)
+    )
+    if num_experts:
+        _masked_marlin_schedule_kernel[(num_experts,)](
+            masked_m,
+            block_offsets,
+            sorted_ids,
+            expert_ids,
+            capacity=capacity,
+            BLOCK_M=block_m,
+            num_warps=1,
+        )
+    return sorted_ids, expert_ids, num_tokens_post_padded
 
 
 def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
@@ -140,6 +205,151 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     w._marlin_repacked = True
 
 
+def _marlin_mxfp4_local_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    local_topk_ids: torch.Tensor | None,
+    topk_weights: torch.Tensor,
+    *,
+    is_ep: bool,
+    masked_m: torch.Tensor | None = None,
+    expected_m: int | None = None,
+) -> torch.Tensor:
+    """Run Marlin for routes whose expert ids are already rank-local.
+
+    Normal DeepEP supplies compact token rows and local top-k ids. Its
+    low-latency leg instead supplies ``[experts, capacity, hidden]`` plus a
+    device-side valid-row count for every expert; in that mode the schedule and
+    SiTU work cover only live rows and leave the capacity tail uninitialized.
+    """
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"Marlin MXFP4 MoE requires bf16 activations, got {x.dtype}")
+    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    hidden = int(getattr(w, "_marlin_hidden_size", x.shape[-1]))
+    ispp = int(getattr(w, "_marlin_ispp", w.w2_weight.shape[1] * 16))
+    num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
+    flat_x = x.reshape(-1, hidden)
+
+    if masked_m is not None:
+        if x.ndim != 3:
+            raise ValueError("masked Marlin input must be [experts, capacity, hidden]")
+        if masked_m.shape != (num_local_experts,):
+            raise ValueError(
+                f"masked_m must have shape {(num_local_experts,)}, got "
+                f"{tuple(masked_m.shape)}"
+            )
+        num_tokens, top_k = flat_x.shape[0], 1
+        block_m = MARLIN_M_BLOCK
+        sorted_ids, expert_ids, num_tokens_post_padded = _masked_marlin_schedule(
+            masked_m, x.shape[1], block_m
+        )
+    else:
+        if local_topk_ids is None or local_topk_ids.ndim != 2:
+            raise ValueError("Marlin local top-k ids must be a 2D tensor")
+        num_tokens, top_k = local_topk_ids.shape
+        if flat_x.shape[0] != num_tokens:
+            raise ValueError(
+                f"Marlin routes have {num_tokens} rows but activations have "
+                f"{flat_x.shape[0]}"
+            )
+        local_topk_ids = local_topk_ids.to(torch.int32)
+        block_m = _block_size_m(num_tokens, top_k, num_local_experts)
+        sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            local_topk_ids, block_m, num_local_experts
+        )
+
+    topk_weights = topk_weights.to(torch.float32)
+    workspace = marlin_make_workspace(flat_x.device)
+    low_latency = masked_m is not None
+
+    gateup_out = (
+        torch.empty(
+            (num_tokens * top_k, 2 * ispp),
+            dtype=flat_x.dtype,
+            device=flat_x.device,
+        )
+        if low_latency
+        else None
+    )
+    gateup = moe_wna16_marlin_gemm(
+        flat_x,
+        gateup_out,
+        w.w13_weight,
+        w.w13_weight_scale,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_m,
+        top_k=top_k,
+        mul_topk_weights=False,
+        is_ep=is_ep,
+        size_m=num_tokens,
+        size_n=2 * ispp,
+        size_k=hidden,
+    )
+
+    beta = float(getattr(w, "activation_situ_beta", 1.0))
+    linear_beta = getattr(w, "activation_situ_linear_beta", None)
+    linear_beta = None if linear_beta is None else float(linear_beta)
+    if low_latency:
+        num_experts, capacity, _ = x.shape
+        gateup = gateup.view(num_experts, capacity, 2 * ispp)
+        if activation != "situ":
+            raise ValueError(
+                f"masked Marlin DeepEP only supports SiTU, got {activation!r}"
+            )
+        down_in = situ_and_mul_masked(
+            gateup,
+            masked_m,
+            beta=beta,
+            linear_beta=linear_beta,
+            expected_m=expected_m,
+        ).view(-1, ispp)
+    elif activation == "situ":
+        down_in = situ_and_mul(gateup, beta=beta, linear_beta=linear_beta)
+    else:
+        from tokenspeed_kernel.ops.activation.triton import silu_and_mul
+
+        down_in = silu_and_mul(gateup)
+
+    expert_out = moe_wna16_marlin_gemm(
+        down_in,
+        (
+            torch.empty(
+                (num_tokens * top_k, hidden),
+                dtype=flat_x.dtype,
+                device=flat_x.device,
+            )
+            if low_latency
+            else torch.zeros(
+                (num_tokens * top_k, hidden),
+                dtype=flat_x.dtype,
+                device=flat_x.device,
+            )
+        ),
+        w.w2_weight,
+        w.w2_weight_scale,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_m,
+        top_k=1,
+        mul_topk_weights=not low_latency,
+        is_ep=is_ep,
+        size_m=num_tokens * top_k,
+        size_n=hidden,
+        size_k=ispp,
+    )
+    if low_latency:
+        return expert_out.view_as(x)
+    return expert_out.view(num_tokens, top_k, hidden).sum(dim=1)
+
+
 @register_kernel(
     "moe",
     "apply",
@@ -204,9 +414,6 @@ def marlin_mxfp4_precomputed_moe_apply(
     if x.dtype != torch.bfloat16:
         raise TypeError(f"Marlin MXFP4 MoE requires bf16 activations, got {x.dtype}")
 
-    activation = plan.get("activation") or getattr(w, "activation", "silu")
-    hidden = int(getattr(w, "_marlin_hidden_size", x.shape[1]))
-    ispp = int(getattr(w, "_marlin_ispp", w.w2_weight.shape[1] * 16))
     num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
     ep_size = int(getattr(w, "ep_size", 1))
     ep_rank = int(getattr(w, "ep_rank", 0))
@@ -231,71 +438,13 @@ def marlin_mxfp4_precomputed_moe_apply(
         local_topk_ids = torch.where(
             topk_ids < 0, topk_ids, mapping[topk_ids.long().clamp_(min=0)]
         )
-        align_num_experts = num_local_experts
     else:
         local_topk_ids = topk_ids
-        align_num_experts = num_local_experts
-
-    num_tokens, top_k = topk_ids.shape
-    block_m = _block_size_m(num_tokens, top_k, align_num_experts)
-    sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        local_topk_ids, block_m, align_num_experts
-    )
-
-    workspace = marlin_make_workspace(x.device)
-
-    gemm1_n = 2 * ispp
-    intermediate1 = moe_wna16_marlin_gemm(
+    return _marlin_mxfp4_local_apply(
+        plan,
         x,
-        None,
-        w.w13_weight,
-        w.w13_weight_scale,
-        workspace,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_padded,
+        w,
+        local_topk_ids,
         topk_weights,
-        moe_block_size=block_m,
-        top_k=top_k,
-        mul_topk_weights=False,
         is_ep=is_ep,
-        size_m=num_tokens,
-        size_n=gemm1_n,
-        size_k=hidden,
-    ).view(-1, gemm1_n)
-
-    beta = float(getattr(w, "activation_situ_beta", 1.0))
-    linear_beta = getattr(w, "activation_situ_linear_beta", None)
-    if activation == "situ":
-        intermediate2 = situ_and_mul(
-            intermediate1,
-            beta=beta,
-            linear_beta=None if linear_beta is None else float(linear_beta),
-        )
-    else:
-        from tokenspeed_kernel.ops.activation.triton import silu_and_mul
-
-        intermediate2 = silu_and_mul(intermediate1)
-
-    # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
-    # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.
-    intermediate3 = moe_wna16_marlin_gemm(
-        intermediate2,
-        torch.zeros(num_tokens * top_k, hidden, dtype=x.dtype, device=x.device),
-        w.w2_weight,
-        w.w2_weight_scale,
-        workspace,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_m,
-        top_k=1,
-        mul_topk_weights=True,
-        is_ep=is_ep,
-        size_m=num_tokens * top_k,
-        size_n=hidden,
-        size_k=ispp,
-    ).view(num_tokens, top_k, hidden)
-
-    return intermediate3.sum(dim=1)
+    )

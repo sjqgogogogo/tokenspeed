@@ -32,6 +32,12 @@ this file. Exercise it with:
 ``torchrun --standalone --nproc-per-node=2 -m pytest -q <this file>``
 ``TEST_DEEPEP_MODE=low_latency torchrun --standalone --nproc-per-node=2 \
   -m pytest -q <this file>``
+
+The exact K3 EP32/TopK16/hidden3584 case is opt-in because it needs 32 H200
+ranks and production-sized expert shards::
+
+``TEST_K3_PRODUCTION_SHAPE=1 torchrun ... --nproc-per-node=8 \
+  -m pytest -q <this file>``
 """
 
 from __future__ import annotations
@@ -74,8 +80,9 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
     num_experts = 4 * world_size
     num_local = num_experts // world_size
     top_k = 4
-    # The DeepEP low-latency kernels are compiled for a fixed hidden-size list
-    # (2048 is the smallest, and also K3's routed latent width).
+    # The DeepEP low-latency kernels are compiled for a fixed hidden-size list;
+    # 2048 is the smallest economical smoke-test width. The opt-in test below
+    # covers K3's real routed latent width (3584).
     hidden_size, intermediate_size = 2048, 256
     num_tokens = 16
     beta, linear_beta = 4.0, 25.0
@@ -157,6 +164,115 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         torch.zeros((num_tokens, num_experts), dtype=torch.float32, device="cuda"),
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        low_latency=(mode == "low_latency"),
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
+    dist.barrier()
+
+
+@pytest.mark.skipif(
+    os.environ.get("TEST_K3_PRODUCTION_SHAPE") != "1" or _world_size() != 32,
+    reason="set TEST_K3_PRODUCTION_SHAPE=1 under a 32-rank H200 torchrun",
+)
+def test_k3_production_shape_topk16_hidden3584_ep32() -> None:
+    """Exercise K3's exact routed geometry without replicating 896 weights.
+
+    Every source selects global experts 0..15, all owned by EP rank 0. Each
+    rank can therefore build only its 28-expert shard while still comparing
+    its returned token against a local dequantized reference for all 16 routes.
+    """
+    import tokenspeed_kernel
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    num_experts, num_local, top_k = 896, 28, 16
+    hidden_size, intermediate_size = 3584, 3072
+    num_tokens = 1
+    beta, linear_beta = 4.0, 25.0
+    generator = torch.Generator(device="cuda").manual_seed(20260825)
+    raw = make_mxfp4_moe_weights(
+        num_local,
+        hidden_size,
+        intermediate_size,
+        generator,
+    )
+    rank_gen = torch.Generator(device="cuda").manual_seed(3000 + rank)
+    x = (
+        torch.randn(
+            num_tokens,
+            hidden_size,
+            generator=rank_gen,
+            device="cuda",
+        )
+        * 0.2
+    ).to(torch.bfloat16)
+    topk_ids = torch.arange(top_k, device="cuda", dtype=torch.int32).view(1, -1)
+    topk_weights = torch.rand(
+        num_tokens,
+        top_k,
+        generator=rank_gen,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    topk_weights /= topk_weights.sum(-1, keepdim=True)
+    expected = a16w4_mxfp4_moe_reference(
+        x,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+    )
+
+    module = torch.nn.Module()
+    module.w13_weight = torch.nn.Parameter(raw["w13_weight"], False)
+    module.w13_weight_scale = torch.nn.Parameter(raw["w13_scale"], False)
+    module.w2_weight = torch.nn.Parameter(raw["w2_weight"], False)
+    module.w2_weight_scale = torch.nn.Parameter(raw["w2_scale"], False)
+    module.top_k = top_k
+    module.num_experts = num_experts
+    module.num_local_experts = num_local
+    module.ep_rank = rank
+    module.ep_size = world_size
+    module.activation = "situ"
+    module.activation_situ_beta = beta
+    module.activation_situ_linear_beta = linear_beta
+
+    mode = _deepep_mode()
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        routing_mode="precomputed_topk",
+        a2a_backend="deepep",
+        ep_size=world_size,
+        ispp=intermediate_size,
+        internal_activation_dtype="input",
+        deepep_group=dist.group.WORLD,
+        deepep_mode=mode,
+        deepep_low_latency_max_num_tokens_per_gpu=(
+            num_tokens if mode == "low_latency" else None
+        ),
+        solution="marlin",
+    )
+    tokenspeed_kernel.moe_process_weights(plan, module)
+    actual = tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        module,
+        torch.zeros((num_tokens, num_experts), dtype=torch.float32, device="cuda"),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        num_tokens_global=world_size,
         low_latency=(mode == "low_latency"),
     )
 

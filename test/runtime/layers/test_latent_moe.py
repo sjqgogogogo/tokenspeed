@@ -363,6 +363,50 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
     assert not plan.joint_moe_reduce
 
 
+def test_kimi3_moe_execution_policy_selects_deepep_marlin() -> None:
+    group = tuple(range(32))
+    mapping = SimpleNamespace(
+        moe=SimpleNamespace(
+            tp_size=1,
+            ep_size=32,
+            ep_group=group,
+            tp_ep_size=32,
+            tp_ep_group=group,
+        )
+    )
+    backend = SimpleNamespace(
+        is_auto=lambda: True,
+        is_flashinfer_trtllm=lambda: False,
+        is_marlin=lambda: False,
+    )
+    all2all_backend = SimpleNamespace(is_deepep=lambda: True)
+
+    with (
+        mock.patch.object(
+            latent_module,
+            "native_latent_moe_available",
+            return_value=False,
+        ),
+        mock.patch.object(
+            latent_module,
+            "_marlin_moe_available",
+            return_value=True,
+        ),
+    ):
+        plan = Kimi3MoEExecutionPlan.build(
+            mapping,
+            backend,
+            alt_stream=None,
+            enforce_eager=False,
+            all2all_backend=all2all_backend,
+        )
+
+    assert plan.use_marlin
+    assert plan.use_deepep_marlin
+    assert plan.use_precomputed_topk
+    assert not plan.use_trtllm
+
+
 def test_kimi3_moe_execution_plan_prepares_latent_fusions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -389,10 +433,9 @@ def test_kimi3_moe_execution_plan_prepares_latent_fusions(
     monkeypatch.setattr(
         latent_module,
         "prepare_all_reduce_fusion",
-        lambda actual_group, width, tokens: norm_calls.append(
-            (actual_group, width, tokens)
-        )
-        or True,
+        lambda actual_group, width, tokens: (
+            norm_calls.append((actual_group, width, tokens)) or True
+        ),
     )
 
     prepared = plan.prepare_latent_fusion(
