@@ -195,6 +195,58 @@ def test_dp_idle_forward_still_polls_pd_events(
     ]
 
 
+def test_dp_idle_forward_still_dispatches_remote_prefill_control_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _EventLoopHarness(pre_set=False)
+    loop.has_dp = True
+    control_op = SimpleNamespace(input_lengths=[])
+    loop._get_forward_op = lambda _plan: (
+        loop.trace.append("get_forward"),
+        control_op,
+    )[1]
+    loop._forward_dispatcher = SimpleNamespace(
+        produces_model_output=lambda op: op is not control_op
+    )
+    loop._dp_sync_and_check = lambda _op: (
+        loop.trace.append("dp_sync"),
+        SimpleNamespace(need_idle_forward=True),
+    )[1]
+    loop.model_executor.execute_idle_forward = (
+        lambda _metadata: loop.trace.append("idle_forward")
+    )
+    loop.model_executor.forward_thread = SimpleNamespace(
+        run=lambda fn: (loop.trace.append("forward_thread_run"), fn())[1]
+    )
+    loop._mark_stats_scheduled = lambda op: loop.trace.append(
+        ("mark_scheduled", op)
+    )
+    loop._batch_logger = SimpleNamespace(
+        log_dispatch=lambda op, _stats: loop.trace.append(("log_batch", op))
+    )
+    loop._dispatch_forward = lambda op, *_args, **_kwargs: (
+        loop.trace.append(("dispatch_control", op)),
+        (None, None),
+    )[1]
+    monkeypatch.setattr(
+        event_loop_module,
+        "advance_scheduler",
+        lambda _scheduler, events: loop.trace.append(("advance", events)),
+    )
+
+    EventLoop.event_loop(loop)
+
+    assert ("mark_scheduled", control_op) in loop.trace
+    assert ("log_batch", control_op) in loop.trace
+    assert ("dispatch_control", control_op) in loop.trace
+    assert loop.trace.index("idle_forward") < loop.trace.index(
+        ("dispatch_control", control_op)
+    )
+    assert loop.trace.index(("dispatch_control", control_op)) < loop.trace.index(
+        "poll_pd"
+    )
+
+
 def test_abort_uses_the_output_marker() -> None:
     calls = []
     output = SimpleNamespace(

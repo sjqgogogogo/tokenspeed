@@ -1209,6 +1209,32 @@ class EventLoop:
                                 dp_metadata,
                             )
                         )
+                        # A Decode-side remote-prefill admission is a
+                        # control-only forward op: scheduler planning already
+                        # allocated and pinned its destination pages, but the
+                        # op itself runs no model collectives. The idle model
+                        # forward above substitutes only for model work; still
+                        # dispatch the control op so it publishes the manifest
+                        # instead of stranding the request in remote Prefilling.
+                        if forward_op is not None and not (
+                            self._forward_dispatcher.produces_model_output(
+                                forward_op
+                            )
+                        ):
+                            self._mark_stats_scheduled(forward_op)
+                            self._batch_logger.log_dispatch(forward_op, stats)
+                            pending, on_first_token = self._dispatch_forward(
+                                forward_op,
+                                [],
+                                dp_metadata=dp_metadata,
+                                grammar_inputs=None,
+                                cache_zero_future=cache_zero_future,
+                            )
+                            if pending is not None or on_first_token is not None:
+                                raise RuntimeError(
+                                    "DP-idle control forward unexpectedly "
+                                    "produced model output"
+                                )
                         # PD progress is local to this DP's Attention-TP group.
                         # Keep consuming its control-plane events even when this
                         # rank only joins a peer DP's model step with an idle
