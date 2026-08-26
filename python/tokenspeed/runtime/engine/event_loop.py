@@ -260,7 +260,10 @@ class EventLoop:
         # scheduler quantities (queue depth, page usage) that the loop already
         # samples, and its counters stay on this thread.
         self._batch_logger = BatchLogger(
-            enabled=global_rank == 0,
+            # One representative per independent scheduler. Decode DP and
+            # Prefill PP otherwise collapse into an indistinguishable global
+            # rank-zero line, hiding load skew and a stuck pipeline stage.
+            enabled=attn_tp_rank == 0,
             decode_log_interval=server_args.decode_log_interval,
             # Usable pages, the same total the load snapshot and the
             # Prometheus gauge publish, so the three never disagree.
@@ -268,6 +271,8 @@ class EventLoop:
             spec_num_steps=model_executor_config.spec_num_steps or 0,
             spec_num_tokens=model_executor_config.spec_num_tokens or 0,
             token_to_kv_pool=token_to_kv_pool,
+            dp_rank=dp_rank,
+            pp_rank=(mapping.pp_rank if mapping.has_pp else 0),
         )
 
         # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
@@ -1041,7 +1046,12 @@ class EventLoop:
             "num_cached_pages": (
                 self._scheduler_cache_geometry.num_usable_pages - available
             ),
+            "num_bootstrapping_reqs": self.scheduler.bootstrapping_size(),
             "num_queue_reqs": self.scheduler.waiting_size(),
+            "num_prefilling_reqs": self.scheduler.prefilling_size(),
+            "num_remote_prefilling_reqs": self.scheduler.remote_prefilling_size(),
+            "num_decoding_reqs": self.scheduler.decoding_size(),
+            "num_pd_transfer_reqs": self.scheduler.pd_transfer_size(),
         }
 
     def _record_scheduler_iteration_metrics(

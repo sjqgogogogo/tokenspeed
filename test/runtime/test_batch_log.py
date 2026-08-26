@@ -30,7 +30,16 @@ import torch
 from tokenspeed.runtime.engine import batch_log as batch_log_module
 from tokenspeed.runtime.engine.batch_log import BatchLogger
 
-STATS = {"num_active_pages": 40, "num_cached_pages": 15, "num_queue_reqs": 7}
+STATS = {
+    "num_active_pages": 40,
+    "num_cached_pages": 15,
+    "num_bootstrapping_reqs": 3,
+    "num_queue_reqs": 7,
+    "num_prefilling_reqs": 5,
+    "num_remote_prefilling_reqs": 4,
+    "num_decoding_reqs": 2,
+    "num_pd_transfer_reqs": 4,
+}
 
 
 def _logger(**overrides) -> BatchLogger:
@@ -41,6 +50,8 @@ def _logger(**overrides) -> BatchLogger:
         spec_num_steps=0,
         spec_num_tokens=0,
         token_to_kv_pool=SimpleNamespace(maybe_log_cache_group_pages=lambda: None),
+        dp_rank=2,
+        pp_rank=3,
     )
     kwargs.update(overrides)
     return BatchLogger(**kwargs)
@@ -74,8 +85,29 @@ def test_extend_round_counts_cached_tokens_once_per_request():
         # cached-token news a second time.
         logger.log_dispatch(op, STATS)
 
-    assert log.call_args_list[0].args[1:] == ("Prefill", 2, 30, 10, 2, 7)
-    assert log.call_args_list[1].args[1:] == ("Prefill", 2, 30, 0, 2, 7)
+    state_counts = (3, 5, 4, 2, 4)
+    assert log.call_args_list[0].args[1:] == (
+        "Prefill",
+        2,
+        3,
+        2,
+        30,
+        10,
+        2,
+        7,
+        *state_counts,
+    )
+    assert log.call_args_list[1].args[1:] == (
+        "Prefill",
+        2,
+        3,
+        2,
+        30,
+        0,
+        2,
+        7,
+        *state_counts,
+    )
 
 
 def test_mixed_round_is_labelled_mix():
@@ -101,9 +133,17 @@ def test_decode_rounds_log_once_per_interval_with_committed_throughput():
     # Rounds 1 and 2 are throttled; round 3 prints the window.
     log.assert_called_once()
     args = log.call_args.args
-    assert args[1:5] == (2, 40, 15, 100)  # running-req, pages active/cached/total
-    assert args[5] == 0.4  # page ratio
-    assert args[6] > 0  # gen throughput over the window
+    assert args[1:7] == (
+        2,
+        3,
+        2,
+        40,
+        15,
+        100,
+    )  # dp/pp rank, running-req, pages active/cached/total
+    assert args[7] == 0.4  # page ratio
+    assert args[8] > 0  # gen throughput over the window
+    assert args[-5:] == (3, 5, 4, 2, 4)
 
 
 def test_disabled_rank_still_counts_but_never_logs():

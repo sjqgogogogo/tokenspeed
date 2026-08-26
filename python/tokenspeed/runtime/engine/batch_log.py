@@ -54,13 +54,16 @@ class BatchLogger:
     """Per-round batch logging for one rank's event loop.
 
     Args:
-        enabled: Emit lines at all (rank 0 only; other ranks still count).
+        enabled: Emit lines on this scheduler's representative rank; other
+            ranks still update counters.
         decode_log_interval: Rounds between two "Decode batch." lines.
         num_total_pages: Device KV pages, for the active/total page ratio.
         spec_num_steps: Draft steps per verify, 0 when speculation is off.
         spec_num_tokens: Verify width, used by the accept-length debug log.
         token_to_kv_pool: Pool asked to log its per-group page usage
             alongside each decode line.
+        dp_rank: Attention-DP scheduler coordinate printed on every line.
+        pp_rank: Pipeline-stage coordinate printed on every line.
     """
 
     def __init__(
@@ -72,6 +75,8 @@ class BatchLogger:
         spec_num_steps: int,
         spec_num_tokens: int,
         token_to_kv_pool,
+        dp_rank: int,
+        pp_rank: int,
     ) -> None:
         self._enabled = enabled
         self._decode_log_interval = decode_log_interval
@@ -79,6 +84,8 @@ class BatchLogger:
         self._spec_num_steps = spec_num_steps
         self._spec_num_tokens = spec_num_tokens
         self._token_to_kv_pool = token_to_kv_pool
+        self._dp_rank = dp_rank
+        self._pp_rank = pp_rank
 
         self._step = 0
         self._seen_prefill_ids: set[str] = set()
@@ -119,14 +126,24 @@ class BatchLogger:
             self._seen_prefill_ids.clear()
         self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
         logger.info(
-            "%s batch. #new-seq: %s, #new-token: %s, #cached-token: %s, "
-            "#running-req: %s, #queue-req: %s",
+            "%s batch. #dp-rank: %s, #pp-rank: %s, #new-seq: %s, "
+            "#new-token: %s, #cached-token: %s, "
+            "#running-req: %s, #queue-req: %s, "
+            "#req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): "
+            "%s/%s/%s/%s/%s",
             mode,
+            self._dp_rank,
+            self._pp_rank,
             num_extends,
             total_tokens,
             cached_tokens,
             bs,
             stats["num_queue_reqs"],
+            stats["num_bootstrapping_reqs"],
+            stats["num_prefilling_reqs"],
+            stats["num_remote_prefilling_reqs"],
+            stats["num_decoding_reqs"],
+            stats["num_pd_transfer_reqs"],
         )
 
     def _log_decode(self, bs: int, stats: dict) -> None:
@@ -144,10 +161,14 @@ class BatchLogger:
         )
         if self._spec_num_steps:
             logger.info(
-                "Decode batch. #running-req: %s, "
+                "Decode batch. #dp-rank: %s, #pp-rank: %s, #running-req: %s, "
                 "#pages(active/cached/total): %s/%s/%s, "
                 "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                "avg_accept_len: %.2f, accept_rate: %.2f, #queue-req: %s",
+                "avg_accept_len: %.2f, accept_rate: %.2f, #queue-req: %s, "
+                "#req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): "
+                "%s/%s/%s/%s/%s",
+                self._dp_rank,
+                self._pp_rank,
                 bs,
                 num_active_pages,
                 stats["num_cached_pages"],
@@ -157,13 +178,22 @@ class BatchLogger:
                 avg_accept,
                 (avg_accept - 1) / self._spec_num_steps,
                 stats["num_queue_reqs"],
+                stats["num_bootstrapping_reqs"],
+                stats["num_prefilling_reqs"],
+                stats["num_remote_prefilling_reqs"],
+                stats["num_decoding_reqs"],
+                stats["num_pd_transfer_reqs"],
             )
         else:
             logger.info(
-                "Decode batch. #running-req: %s, "
+                "Decode batch. #dp-rank: %s, #pp-rank: %s, #running-req: %s, "
                 "#pages(active/cached/total): %s/%s/%s, "
                 "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                "#queue-req: %s",
+                "#queue-req: %s, "
+                "#req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): "
+                "%s/%s/%s/%s/%s",
+                self._dp_rank,
+                self._pp_rank,
                 bs,
                 num_active_pages,
                 stats["num_cached_pages"],
@@ -171,6 +201,11 @@ class BatchLogger:
                 page_ratio,
                 gen_throughput,
                 stats["num_queue_reqs"],
+                stats["num_bootstrapping_reqs"],
+                stats["num_prefilling_reqs"],
+                stats["num_remote_prefilling_reqs"],
+                stats["num_decoding_reqs"],
+                stats["num_pd_transfer_reqs"],
             )
         self._token_to_kv_pool.maybe_log_cache_group_pages()
         self._num_generated_tokens = 0

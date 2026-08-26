@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import time
+
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
@@ -33,10 +35,25 @@ from tokenspeed.runtime.pd.mooncake.prefill import (
 from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
+from tokenspeed_scheduler import PD, Forward
 
 logger = get_colorful_logger(__name__)
 
-from tokenspeed_scheduler import PD, Forward
+_BOOTSTRAP_DIAGNOSTIC_MIN_AGE_SECONDS = 1.0
+_BOOTSTRAP_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 10.0
+_BOOTSTRAP_DIAGNOSTIC_SAMPLE_LIMIT = 8
+
+
+def _poll_name(status: int | None) -> str:
+    names = {
+        TransferPoll.Failed: "Failed",
+        TransferPoll.Bootstrapping: "Bootstrapping",
+        TransferPoll.Bootstrapped: "Bootstrapped",
+        TransferPoll.WaitingForInput: "WaitingForInput",
+        TransferPoll.Transferring: "Transferring",
+        TransferPoll.Success: "Success",
+    }
+    return names.get(status, f"Unknown({status})")
 
 
 class DisaggPrefillExecutor:
@@ -58,6 +75,8 @@ class DisaggPrefillExecutor:
         self._request_token: dict[str, int] = {}
         self._request_spec_candidate_ids: dict[str, list[int]] = {}
         self._layerwise_token_published = set()
+        self._bootstrap_diagnostic_last_log = 0.0
+        self._prealloc_without_sender_since: dict[int, float] = {}
 
     def store_prefill_token(
         self,
@@ -416,14 +435,120 @@ class DisaggPrefillExecutor:
     def execute(self, op):
         self._dispatcher(op)
 
+    def _log_bootstrap_diagnostics(
+        self, request_ids: list[str], polls: list[int]
+    ) -> None:
+        """Periodically expose requests blocked before Prefill scheduling.
+
+        A local ``Bootstrapped`` plus global ``Bootstrapping`` status means a
+        different PP/TP rank has not received its pre-allocation. A room in
+        ``transfer_infos`` without a live sender means pre-allocation arrived
+        before request registration, or arrived late after the request was
+        already failed and reaped.
+        """
+        now = time.monotonic()
+        wall_now = time.time()
+        pending = []
+        has_local_gap = False
+        for req_id, poll in zip(request_ids, polls, strict=True):
+            if (
+                self._local_states.get(req_id) != TransferPoll.Bootstrapping
+                or poll != TransferPoll.Bootstrapping
+            ):
+                continue
+            sender = self.senders[req_id]
+            age = max(wall_now - sender.init_time, 0.0)
+            if age < _BOOTSTRAP_DIAGNOSTIC_MIN_AGE_SECONDS:
+                continue
+            local = self.kv_manager.room_status(sender.bootstrap_room)
+            has_local_gap = has_local_gap or local == TransferPoll.Bootstrapping
+            pending.append(
+                (
+                    req_id,
+                    sender.bootstrap_room,
+                    age,
+                    local,
+                    poll,
+                )
+            )
+
+        active_rooms = {sender.bootstrap_room for sender in self.senders.values()}
+        try:
+            # The bootstrap worker mutates this dict concurrently. Diagnostics
+            # are best-effort and must never perturb request processing.
+            prealloc_rooms = set(tuple(self.kv_manager.transfer_infos))
+        except RuntimeError:
+            return
+        rooms_without_sender = prealloc_rooms - active_rooms
+        if not hasattr(self, "_prealloc_without_sender_since"):
+            self._prealloc_without_sender_since = {}
+        for room in rooms_without_sender:
+            self._prealloc_without_sender_since.setdefault(room, now)
+        for room in tuple(self._prealloc_without_sender_since):
+            if room not in rooms_without_sender:
+                self._prealloc_without_sender_since.pop(room, None)
+        aged_rooms_without_sender = [
+            room
+            for room in sorted(rooms_without_sender)
+            if now - self._prealloc_without_sender_since[room]
+            >= _BOOTSTRAP_DIAGNOSTIC_MIN_AGE_SECONDS
+        ]
+
+        if not pending and not aged_rooms_without_sender:
+            return
+        topology = self.kv_manager.topology
+        global_rank = getattr(topology, "global_rank", -1)
+        # Rank zero prints the global-consensus summary. Ranks that are locally
+        # missing pre-allocation also print so the bad PP/TP coordinate is visible.
+        if global_rank != 0 and not has_local_gap:
+            return
+        if (
+            now - getattr(self, "_bootstrap_diagnostic_last_log", 0.0)
+            < _BOOTSTRAP_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._bootstrap_diagnostic_last_log = now
+
+        sample = [
+            "rid=%s room=%s age=%.1fs local=%s global=%s"
+            % (req_id, room, age, _poll_name(local), _poll_name(global_poll))
+            for req_id, room, age, local, global_poll in pending[
+                :_BOOTSTRAP_DIAGNOSTIC_SAMPLE_LIMIT
+            ]
+        ]
+        if pending:
+            logger.warning(
+                "[prefill][bootstrap_pending] global_rank=%s pp_rank=%s "
+                "tp_rank=%s count=%s sample=%s",
+                global_rank,
+                getattr(topology, "pp_rank", 0),
+                getattr(topology, "tp_rank", -1),
+                len(pending),
+                sample,
+            )
+        if aged_rooms_without_sender:
+            logger.warning(
+                "[prefill][prealloc_without_sender] global_rank=%s pp_rank=%s "
+                "tp_rank=%s count=%s rooms=%s; pre-allocation arrived before "
+                "request registration or after its sender was reaped",
+                global_rank,
+                getattr(topology, "pp_rank", 0),
+                getattr(topology, "tp_rank", -1),
+                len(aged_rooms_without_sender),
+                aged_rooms_without_sender[:_BOOTSTRAP_DIAGNOSTIC_SAMPLE_LIMIT],
+            )
+
     def generate_events(self):
         if not self.senders:
+            self._log_bootstrap_diagnostics([], [])
             return []
+        request_ids = list(self.senders)
         polls = poll_and_all_reduce(self.senders.values(), self.gloo_group)
+        self._log_bootstrap_diagnostics(request_ids, polls)
 
         events = []
         to_remove = []
-        for req_id, poll in zip(list(self.senders.keys()), polls):
+        for req_id, poll in zip(request_ids, polls, strict=True):
             if (
                 self._local_states[req_id] == TransferPoll.Bootstrapping
                 and poll == TransferPoll.Bootstrapped

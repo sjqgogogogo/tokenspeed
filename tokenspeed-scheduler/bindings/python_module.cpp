@@ -316,9 +316,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  }
                  return result;
              })
+        .def("bootstrapping_size", &tokenspeed::Scheduler::BootstrappingSize)
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
+        .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize)
+        .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize)
         .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
         .def("available_kv_pages", &tokenspeed::Scheduler::AvailableKvPages)
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)

@@ -4,6 +4,7 @@ import os
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -17,11 +18,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from runtime.cache_pd_test_utils import block_manifest as make_block_manifest
+from runtime.cache_pd_test_utils import block_manifest as make_block_manifest  # noqa: E402
 from runtime.cache_pd_test_utils import group as make_group  # noqa: E402
-from runtime.cache_pd_test_utils import layout as make_layout
-from runtime.cache_pd_test_utils import operation as make_operation
-from runtime.cache_pd_test_utils import segment as make_segment
+from runtime.cache_pd_test_utils import layout as make_layout  # noqa: E402
+from runtime.cache_pd_test_utils import operation as make_operation  # noqa: E402
+from runtime.cache_pd_test_utils import segment as make_segment  # noqa: E402
 
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
     CachePDBlockManifest,
@@ -959,6 +960,64 @@ def test_receiver_bootstrap_failure_is_not_overwritten(
         (9, TransferPoll.Failed),
     ]
     assert failures and failures[0][0] == 9
+
+
+def test_prefill_bootstrap_diagnostic_shows_local_and_global_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+    from tokenspeed.runtime.pd import prefill_executor as prefill_module
+
+    sender = SimpleNamespace(bootstrap_room=9, init_time=100.0)
+    executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor.senders = {"request-0": sender}
+    executor._local_states = {"request-0": TransferPoll.Bootstrapping}
+    executor.kv_manager = SimpleNamespace(
+        room_status=lambda _room: TransferPoll.Bootstrapped,
+        transfer_infos={},
+        topology=SimpleNamespace(global_rank=0, pp_rank=0, tp_rank=0),
+    )
+    executor._bootstrap_diagnostic_last_log = 0.0
+    executor._prealloc_without_sender_since = {}
+    monkeypatch.setattr(prefill_module.time, "monotonic", lambda: 20.0)
+    monkeypatch.setattr(prefill_module.time, "time", lambda: 110.0)
+
+    with mock.patch.object(prefill_module.logger, "warning") as warning:
+        executor._log_bootstrap_diagnostics(["request-0"], [TransferPoll.Bootstrapping])
+
+    warning.assert_called_once()
+    args = warning.call_args.args
+    assert "[prefill][bootstrap_pending]" in args[0]
+    assert args[-1] == [
+        "rid=request-0 room=9 age=10.0s local=Bootstrapped global=Bootstrapping"
+    ]
+
+
+def test_prefill_diagnostic_reports_preallocation_without_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed.runtime.pd import prefill_executor as prefill_module
+
+    executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor.senders = {}
+    executor._local_states = {}
+    executor.kv_manager = SimpleNamespace(
+        transfer_infos={77: {}},
+        topology=SimpleNamespace(global_rank=0, pp_rank=2, tp_rank=0),
+    )
+    executor._bootstrap_diagnostic_last_log = 0.0
+    executor._prealloc_without_sender_since = {}
+    monotonic_times = iter((20.0, 22.0))
+    monkeypatch.setattr(prefill_module.time, "monotonic", lambda: next(monotonic_times))
+
+    with mock.patch.object(prefill_module.logger, "warning") as warning:
+        executor._log_bootstrap_diagnostics([], [])
+        executor._log_bootstrap_diagnostics([], [])
+
+    warning.assert_called_once()
+    args = warning.call_args.args
+    assert "[prefill][prealloc_without_sender]" in args[0]
+    assert args[-2:] == (1, [77])
 
 
 if __name__ == "__main__":

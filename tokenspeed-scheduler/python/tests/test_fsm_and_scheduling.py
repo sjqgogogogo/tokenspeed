@@ -138,9 +138,37 @@ class TestFSMTransitions:
         """Newly submitted request is in Submitted (waiting) state."""
         s = Scheduler(make_config())
         submit(s, "r0", list(range(8)))
+        assert s.bootstrapping_size() == 0
         assert s.waiting_size() == 1
         assert s.prefilling_size() == 0
+        assert s.remote_prefilling_size() == 0
         assert s.decoding_size() == 0
+        assert s.pd_transfer_size() == 0
+
+    def test_pd_state_counts_distinguish_bootstrap_and_remote_prefill_wait(self):
+        cfg = make_config()
+        cfg.role = SchedulerConfig.Role.D
+        cfg.enable_pd_cache = True
+        cfg.cache_groups[0].transfer_policy = CacheTransferPolicy.FullSuffix
+        s = Scheduler(cfg)
+        s.submit_requests([make_spec("r0", list(range(8)))])
+
+        assert s.bootstrapping_size() == 1
+        assert s.waiting_size() == 0
+        assert s.remote_prefilling_size() == 0
+
+        s.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("r0")))
+        assert s.bootstrapping_size() == 0
+        assert s.waiting_size() == 1
+
+        admission = s.next_execution_plan()
+        assert admission.forward[0].request_ids == ["r0"]
+        assert admission.forward[0].num_extends() == 1
+        assert s.waiting_size() == 0
+        assert s.prefilling_size() == 1
+        assert s.remote_prefilling_size() == 1
+        assert s.decoding_size() == 0
+        assert s.pd_transfer_size() == 1
 
     def test_first_plan_moves_submitted_to_prefilling(self):
         """After first next_execution_plan, request leaves Submitted (waiting → 0)."""

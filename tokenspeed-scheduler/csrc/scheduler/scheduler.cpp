@@ -363,6 +363,11 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     }
 }
 
+std::size_t Scheduler::BootstrappingSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const auto& item) { return item.second->template Is<fsm::Bootstrapping>(); }));
+}
+
 std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& item) {
         return item.second->template Is<fsm::Submitted>() || item.second->template Is<fsm::Retracted>();
@@ -377,6 +382,13 @@ std::size_t Scheduler::DecodingSize() const {
 std::size_t Scheduler::PrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& item) {
         return item.second->template Is<fsm::Prefilling>() || item.second->template Is<fsm::PrefillDone>();
+    }));
+}
+
+std::size_t Scheduler::RemotePrefillSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const auto& item) {
+        return item.second->template Is<fsm::Prefilling>() &&
+               item.second->PrefillSource() == fsm::PrefillSource::kRemote;
     }));
 }
 

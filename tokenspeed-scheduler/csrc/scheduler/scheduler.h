@@ -63,11 +63,14 @@ public:
     // Host L2 prefix indexes were removed.
     bool ClearCache();
 
+    std::size_t BootstrappingSize() const;
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t AvailableKvPages() const;
     std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
+    std::size_t RemotePrefillSize() const;
+    std::size_t PdTransferSize() const { return pd_transfer_pins_.size(); }
     std::int32_t RequestTokenSize(const std::string& id) const;
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit
