@@ -146,6 +146,55 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
     ]
 
 
+def test_dp_idle_forward_still_polls_pd_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _EventLoopHarness(pre_set=False)
+    loop.has_dp = True
+    loop._dp_sync_and_check = lambda _op: (
+        loop.trace.append("dp_sync"),
+        SimpleNamespace(need_idle_forward=True),
+    )[1]
+    loop.model_executor.execute_idle_forward = (
+        lambda _metadata: loop.trace.append("idle_forward")
+    )
+    loop.model_executor.forward_thread = SimpleNamespace(
+        run=lambda fn: (loop.trace.append("forward_thread_run"), fn())[1]
+    )
+    loop._pd_hooks = SimpleNamespace(
+        poll_transfer_events=lambda: (
+            loop.trace.append("poll_pd"),
+            ["pd-event"],
+        )[1]
+    )
+    monkeypatch.setattr(
+        event_loop_module,
+        "advance_scheduler",
+        lambda _scheduler, events: loop.trace.append(("advance", events)),
+    )
+
+    EventLoop.event_loop(loop)
+
+    assert loop.trace == [
+        "process_requests",
+        "drain_epd",
+        "poll_cache",
+        "next_plan",
+        "submit_cache",
+        "get_forward",
+        "stats",
+        "observe_load",
+        "metrics",
+        "dp_sync",
+        "forward_thread_run",
+        "idle_forward",
+        "poll_pd",
+        ("advance", ["pd-event"]),
+        "publish_kv",
+        "pause_finish",
+    ]
+
+
 def test_abort_uses_the_output_marker() -> None:
     calls = []
     output = SimpleNamespace(

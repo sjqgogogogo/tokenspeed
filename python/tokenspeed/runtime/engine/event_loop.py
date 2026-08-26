@@ -1209,6 +1209,14 @@ class EventLoop:
                                 dp_metadata,
                             )
                         )
+                        # PD progress is local to this DP's Attention-TP group.
+                        # Keep consuming its control-plane events even when this
+                        # rank only joins a peer DP's model step with an idle
+                        # forward; otherwise bootstrap/completion events wait
+                        # until every DP happens to become idle together.
+                        request_changes.extend(
+                            self._pd_hooks.poll_transfer_events()
+                        )
                         idle_round = True
 
             if not idle_round:
