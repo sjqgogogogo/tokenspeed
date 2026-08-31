@@ -281,7 +281,8 @@ def test_pp_parent_count_uses_distributed_minimum(monkeypatch) -> None:
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(
-        "tokenspeed.runtime.distributed.pg_manager.get_process_group",
+        "tokenspeed.runtime.distributed.process_group_manager."
+        "process_group_manager.get_process_group",
         lambda backend, group: calls.append((backend, group)) or object(),
     )
 

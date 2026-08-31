@@ -407,13 +407,15 @@ class KimiK3Recipe(CacheRecipe):
         ):
             return local_count
 
-        from tokenspeed.runtime.distributed import pg_manager
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager,
+        )
 
         count = torch.tensor(local_count, dtype=torch.int64)
         torch.distributed.all_reduce(
             count,
             op=torch.distributed.ReduceOp.MIN,
-            group=pg_manager.get_process_group("gloo", mapping.world_group),
+            group=process_group_manager.get_process_group("gloo", mapping.world_group),
         )
         return int(count.item())
 
