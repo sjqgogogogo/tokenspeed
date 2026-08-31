@@ -238,6 +238,14 @@ class DFlash(BaseDrafter):
         self.target_model = target_model
         self.target_language_model = language_model
         self.embed_tokens = target_model.get_input_embeddings()
+        if self.embed_tokens is None:
+            self.embed_tokens = getattr(self.model, "embed_tokens", None)
+        if self.embed_tokens is None:
+            raise ValueError(
+                "DFLASH requires an input embedding on the target or draft; "
+                "a PP Prefill draft should load its checkpoint embedding on "
+                "the last stage"
+            )
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
         if not hasattr(target_model, "set_dflash_layers_to_capture"):
@@ -538,13 +546,29 @@ class DFlash(BaseDrafter):
         target_hidden = target_hidden.to(device=self.device, dtype=model.context_dtype)
         expected_width = model.context_in_features
         actual_width = int(target_hidden.shape[-1])
-        if actual_width != expected_width:
+        projected_width = int(getattr(model.config, "hidden_size", 0))
+        projected_writer = getattr(model, "write_projected_context_kv", None)
+        already_projected = (
+            getattr(getattr(self.target_model, "mapping", None), "has_pp", False)
+            and projected_writer is not None
+            and actual_width == projected_width
+        )
+        if actual_width != expected_width and not already_projected:
             raise RuntimeError(
                 "DFLASH captured hidden width mismatch: "
-                f"expected {expected_width}, got {actual_width}. "
+                f"expected {expected_width} raw or {projected_width} projected, "
+                f"got {actual_width}. "
                 "Check dflash_config.target_layer_ids against the target model."
             )
         with torch.inference_mode():
+            if already_projected:
+                projected_writer(
+                    target_hidden,
+                    target_positions,
+                    target_cache_locs,
+                    self.token_to_kv_pool,
+                )
+                return
             ctx_hidden = model.project_target_hidden(target_hidden)
             if decode_only and self._fused_kv_enabled:
                 self._write_native_cache_fused(

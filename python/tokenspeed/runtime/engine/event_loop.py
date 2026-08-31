@@ -530,14 +530,24 @@ class EventLoop:
         if server_args.disaggregation_mode != "null":
             assert pd_topology is not None
             pp_layer_window = None
+            pp_layer_partition = None
             if server_args.mapping.has_pp:
                 from tokenspeed.runtime.distributed.pp_stage import (
-                    pp_layer_window as resolve_pp_layer_window,
+                    pp_cache_stage_windows,
                 )
 
-                pp_layer_window = resolve_pp_layer_window(
-                    self.model_config.num_attention_layers, server_args.mapping
+                cache_windows = pp_cache_stage_windows(
+                    self.model_config.num_attention_layers,
+                    (
+                        draft_model_config.num_attention_layers
+                        if draft_model_config is not None
+                        else 0
+                    ),
+                    server_args.mapping.pp_size,
+                    server_args.mapping.pp_layer_partition,
                 )
+                pp_layer_window = cache_windows[server_args.mapping.pp_rank]
+                pp_layer_partition = tuple(end - start for start, end in cache_windows)
             kv_args = get_kv_args(
                 global_rank,
                 global_rank,
@@ -546,6 +556,7 @@ class EventLoop:
                 model_config=self.model_config,
                 draft_model_config=draft_model_config,
                 pp_layer_window=pp_layer_window,
+                pp_layer_partition=pp_layer_partition,
             )
             pd_manager_args = KVManagerArgs(
                 bootstrap_port=server_args.disaggregation_bootstrap_port,

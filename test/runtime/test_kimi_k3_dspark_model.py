@@ -126,6 +126,51 @@ def test_model_type_and_latent_geometry() -> None:
     assert config.qk_head_dim == 192
 
 
+def _pp_projection_model(weight: torch.Tensor, tp_rank: int):
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        hidden_size=4,
+        target_hidden_size=4,
+    )
+    model.mapping = SimpleNamespace(
+        attn=SimpleNamespace(
+            tp_size=2,
+            tp_rank=tp_rank,
+            tp_group=(0, 1),
+        )
+    )
+    model.num_context_features = 2
+    model.context_proj = SimpleNamespace(weight=torch.nn.Parameter(weight))
+    model.context_norm = torch.nn.Identity()
+    model.fc_norm = None
+    return model
+
+
+def test_pp_context_projection_accumulates_exact_tp_row_shards(monkeypatch) -> None:
+    weight = torch.arange(32, dtype=torch.float32).reshape(4, 8) / 32
+    first = torch.arange(12, dtype=torch.float32).reshape(3, 4) / 10
+    second = first + 2
+    shards = []
+    for tp_rank in range(2):
+        model = _pp_projection_model(weight, tp_rank)
+        accumulator = torch.zeros(3, 2)
+        model.accumulate_pp_target_hidden(accumulator, first, 0)
+        model.accumulate_pp_target_hidden(accumulator, second, 1)
+        shards.append(accumulator)
+
+    expected = torch.nn.functional.linear(torch.cat((first, second), dim=-1), weight)
+    torch.testing.assert_close(torch.cat(shards, dim=-1), expected)
+
+    model = _pp_projection_model(weight, 0)
+    monkeypatch.setattr(
+        dspark_model_module,
+        "all_gather",
+        lambda value, group, dim: torch.cat(shards, dim=dim),
+    )
+    torch.testing.assert_close(model.finalize_pp_target_context(shards[0]), expected)
+
+
 def test_yarn_scaling_is_translated_for_get_rope() -> None:
     config = make_config()
     scaling = config.rope_scaling_dict()

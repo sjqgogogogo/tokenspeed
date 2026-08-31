@@ -796,10 +796,18 @@ class ServerArgs:
                     "supported yet"
                 )
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "--pipeline-parallel-size > 1 does not support "
-                    "speculative decoding"
+                pp_dspark_prefill = (
+                    self.disaggregation_mode == "prefill"
+                    and self.speculative_algorithm == "DSPARK"
+                    and not self.draft_model_path_use_base
+                    and self.disaggregation_layerwise_interval == 0
                 )
+                if not pp_dspark_prefill:
+                    raise ValueError(
+                        "--pipeline-parallel-size > 1 supports speculative "
+                        "decoding only for an external DSPARK draft on a "
+                        "Prefill worker with --disaggregation-layerwise-interval 0"
+                    )
             if (
                 self.pp_layer_partition is not None
                 and len(self.pp_layer_partition) != self.pipeline_parallel_size

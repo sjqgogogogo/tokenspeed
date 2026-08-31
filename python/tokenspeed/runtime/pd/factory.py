@@ -42,6 +42,7 @@ def get_kv_args(
     model_config,
     draft_model_config=None,
     pp_layer_window: tuple[int, int] | None = None,
+    pp_layer_partition: tuple[int, ...] | None = None,
 ):
     # One big model, one arena: a draft's continuation-layer planes live in
     # the target pool's merged plan, so exactly one typed slab registration is
@@ -87,6 +88,7 @@ def get_kv_args(
         cache_layout=layout,
         cache_producer_schedule=producer_schedule,
         pp_layer_window=pp_layer_window,
+        pp_layer_partition=pp_layer_partition,
         wire_cache_layout=wire_layout,
     )
 

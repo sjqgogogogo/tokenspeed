@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -599,7 +600,7 @@ def _create_draft_components(
     model_config,
     config,
     pool,
-    cache_spec: CachePoolSpec,
+    cache_spec: CachePoolSpec | None,
     num_target_layers: int,
     full_attn_backend_name: str | None,
     is_heterogeneous: bool,
@@ -616,7 +617,7 @@ def _create_draft_components(
     way through -- the view *is* the mapping, and an id outside the window is
     rejected rather than silently offset onto another model's planes.
     """
-    if config is None:
+    if config is None or cache_spec is None:
         return None, None
     if is_heterogeneous and (is_hybrid_linear or is_inkling):
         raise RuntimeError(
@@ -924,19 +925,33 @@ def create_attn_components(
         # the full model's so every rank's scheduler plans identically; keep
         # the full plan for the PD wire contract (every stage registers the
         # same logical layout, Decode plans stage windows against it).
-        from dataclasses import replace as _dc_replace
+        from tokenspeed.runtime.distributed.pp_stage import pp_cache_stage_windows
 
-        from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
-
-        stage_start, stage_end = pp_layer_window(
-            len(spec.layer_types), server_args.mapping
+        cache_windows = pp_cache_stage_windows(
+            cache_setup.num_target_layers,
+            cache_setup.num_draft_layers,
+            server_args.mapping.pp_size,
+            server_args.mapping.pp_layer_partition,
         )
+        stage_start, stage_end = cache_windows[server_args.mapping.pp_rank]
         pp_logical_plan = spec.memory_plan
-        spec = _dc_replace(
+        physical_plan = spec.memory_plan.narrow_to_layers(stage_start, stage_end)
+        spec = replace(
             spec,
-            memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
+            memory_plan=physical_plan,
         )
-        target_spec = spec
+        target_spec = replace(target_spec, memory_plan=physical_plan)
+        if draft_view_spec is not None:
+            if server_args.mapping.is_last_pp_rank:
+                draft_view_spec = replace(
+                    draft_view_spec,
+                    memory_plan=physical_plan,
+                )
+            else:
+                # The speculative draft executes only on the last Prefill
+                # stage. Earlier stages carry its projected target context but
+                # own no draft cache fields or attention backend.
+                draft_view_spec = None
     arena = create_cache_arena(
         spec,
         device=config.device,

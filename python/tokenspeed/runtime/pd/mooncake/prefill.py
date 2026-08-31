@@ -1078,7 +1078,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
-        pp_layer_partition = getattr(self.topology, "pp_layer_partition", None)
+        pp_layer_partition = getattr(self.kv_args, "pp_layer_partition", None)
+        if pp_layer_partition is None:
+            pp_layer_partition = getattr(self.topology, "pp_layer_partition", None)
         payload = {
             "role": "Prefill",
             "world_size": self.topology.world_size,
@@ -1113,6 +1115,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
 
 
-from tokenspeed.runtime.pd.mooncake.sender import MooncakeKVSender
+from tokenspeed.runtime.pd.mooncake.sender import MooncakeKVSender  # noqa: E402
 
 __all__ = ["MooncakeKVManagerPrefill", "MooncakeKVSender"]

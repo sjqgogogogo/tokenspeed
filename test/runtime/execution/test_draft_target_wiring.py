@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,10 +36,13 @@ from tokenspeed.runtime.execution.drafter.eagle import Eagle  # noqa: E402
 from tokenspeed.runtime.execution.drafter.mtp import Mtp  # noqa: E402
 
 
-def _server_args(algo: str, capture_ids=None) -> SimpleNamespace:
+def _server_args(
+    algo: str, capture_ids=None, *, has_pp: bool = False
+) -> SimpleNamespace:
     return SimpleNamespace(
         speculative_algorithm=algo,
         eagle3_layers_to_capture=capture_ids,
+        mapping=SimpleNamespace(has_pp=has_pp),
     )
 
 
@@ -125,6 +129,19 @@ def test_wire_dflash_keeps_own_embed_head():
     draft.model.set_embed_and_head.assert_not_called()
 
 
+def test_wire_pp_dspark_installs_projected_context_support():
+    target, draft = mock.MagicMock(), mock.MagicMock()
+
+    with mock.patch.object(factory, "get_drafter_impl", return_value=DSpark):
+        factory._wire_draft_to_target_model(
+            _server_args("DSPARK", has_pp=True),
+            target,
+            draft,
+        )
+
+    target.model.configure_pp_dspark.assert_called_once_with(draft.model)
+
+
 def test_base_wire_target_is_a_noop():
     drafter = mock.MagicMock(spec=BaseDrafter)
     target_model = mock.MagicMock()
@@ -162,6 +179,59 @@ def test_dflash_wire_target_installs_capture_hooks():
     )
     assert drafter.embed_tokens is target_model.get_input_embeddings.return_value
     assert drafter.lm_head is target_model.lm_head
+
+
+def test_dflash_pp_last_stage_uses_draft_checkpoint_embedding():
+    drafter = mock.MagicMock(spec=DFlash)
+    drafter._incremental_proj_enabled = False
+    drafter.target_layer_ids = [4, 5]
+    drafter.model = SimpleNamespace(
+        embed_tokens=object(),
+        config=SimpleNamespace(aux_hidden_stream="prefix"),
+    )
+    target_model = mock.MagicMock(
+        spec=[
+            "get_input_embeddings",
+            "lm_head",
+            "logits_processor",
+            "set_dflash_layers_to_capture",
+        ]
+    )
+    target_model.get_input_embeddings.return_value = None
+
+    DFlash.wire_target(drafter, target_model)
+
+    assert drafter.embed_tokens is drafter.model.embed_tokens
+
+
+def test_dflash_accepts_preprojected_pp_context() -> None:
+    writer = mock.Mock()
+    model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=4),
+        context_dtype=torch.float32,
+        context_in_features=20,
+        write_projected_context_kv=writer,
+        project_target_hidden=mock.Mock(
+            side_effect=AssertionError("must not project PP context twice")
+        ),
+    )
+    drafter = DFlash.__new__(DFlash)
+    drafter.draft_model_runner = SimpleNamespace(model=model)
+    drafter.target_model = SimpleNamespace(mapping=SimpleNamespace(has_pp=True))
+    drafter.device = torch.device("cpu")
+    drafter.token_to_kv_pool = object()
+    hidden = torch.ones(3, 4)
+    positions = torch.arange(3)
+    cache_locs = torch.arange(3, dtype=torch.int32)
+
+    DFlash._write_native_cache(drafter, hidden, positions, cache_locs)
+
+    writer.assert_called_once()
+    args = writer.call_args.args
+    assert args[0] is hidden
+    assert args[1] is positions
+    assert args[2] is cache_locs
+    assert args[3] is drafter.token_to_kv_pool
 
 
 def test_dspark_wire_target_installs_capture_layers():

@@ -104,6 +104,40 @@ def pp_layer_window(num_hidden_layers: int, mapping: Mapping) -> tuple[int, int]
     return pp_stage_windows(num_hidden_layers, pp_size, partition)[pp_rank]
 
 
+def pp_cache_stage_windows(
+    num_target_layers: int,
+    num_draft_layers: int,
+    pp_size: int,
+    target_partition: tuple[int, ...] | None = None,
+) -> list[tuple[int, int]]:
+    """Assign target layers by PP stage and all draft layers to the last stage.
+
+    Target execution is pipelined, while a speculative draft executes only on
+    the last Prefill stage after the target hidden-state features have arrived.
+    Draft cache fields therefore must not participate in the target's even PP
+    split: doing so would put draft KV on stages that never execute the draft.
+
+    Args:
+        num_target_layers: Number of target-model layers.
+        num_draft_layers: Number of continuation-layer cache entries owned by
+            the speculative draft.
+        pp_size: Number of Prefill pipeline stages.
+        target_partition: Optional explicit target-layer counts per stage.
+
+    Returns:
+        Contiguous global cache-layer windows.  Target layers occupy
+        ``[0, num_target_layers)`` and the last window is extended through the
+        draft continuation range.
+    """
+    if num_draft_layers < 0:
+        raise ValueError("num_draft_layers must be non-negative")
+    windows = pp_stage_windows(num_target_layers, pp_size, target_partition)
+    if num_draft_layers:
+        start, end = windows[-1]
+        windows[-1] = (start, end + num_draft_layers)
+    return windows
+
+
 @dataclass
 class PPStageState:
     """Inter-stage tensor bundle in a fixed wire order.
@@ -123,6 +157,10 @@ class PPStageState:
     # own (full-size) buffer with these rows; its block-write layers fill the
     # rest.
     block_residual: torch.Tensor | None = None
+    # PP-aware DSpark: the target-tap projection accumulated so far.  It stays
+    # sharded on Attention TP's output dimension, so corresponding TP ranks
+    # exchange only [tokens, hidden / tp] rather than replicated raw taps.
+    draft_context_shard: torch.Tensor | None = None
 
     def tensors(self) -> list[torch.Tensor]:
         out = []

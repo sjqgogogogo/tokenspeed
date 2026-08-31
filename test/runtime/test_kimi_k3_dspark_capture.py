@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -67,6 +69,59 @@ def test_negative_taps_are_rejected() -> None:
     holder = _CausalLM(_make_model(num_layers=93))
     with pytest.raises(ValueError, match="invalid ids"):
         holder.set_dflash_layers_to_capture([-1, 23])
+
+
+def test_pp_stage_accumulates_projected_taps_into_boundary_state() -> None:
+    from tokenspeed.runtime.models import kimi_k3
+
+    class _Layer:
+        def __init__(self, delta: float):
+            self.delta = delta
+
+        def __call__(self, positions, prefix, ctx, out_cache_loc, blocks):
+            return prefix + self.delta, blocks
+
+    class _Projector:
+        pp_context_shard_width = 1
+        context_dtype = torch.float32
+
+        @staticmethod
+        def accumulate_pp_target_hidden(accumulator, hidden, capture_index):
+            accumulator.add_(hidden * (capture_index + 1))
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            hidden_size=1, num_hidden_layers=4, attn_res_block_size=2
+        ),
+        mapping=SimpleNamespace(is_last_pp_rank=False),
+        pp_start_layer=0,
+        pp_end_layer=2,
+        embed_tokens=lambda ids: ids.float().unsqueeze(-1),
+        layers=[_Layer(1), _Layer(2), object(), object()],
+        layers_to_capture=[0, 1],
+        _dflash_capture_idx_map={0: 0, 1: 1},
+        _dflash_incremental_callback=None,
+        _dflash_slot_bufs=None,
+        dflash_aux_stream="prefix",
+        eagle3_layers_to_capture=(),
+        _pp_dspark_projector=_Projector(),
+    )
+
+    state, aux = kimi_k3.KimiLinearModel.forward(
+        model,
+        torch.tensor([1, 2]),
+        positions=None,
+        ctx=None,
+        out_cache_loc=None,
+    )
+
+    assert aux is None
+    torch.testing.assert_close(state.hidden_states, torch.tensor([[4.0], [5.0]]))
+    # Tap 0 sees [2,3]; tap 1 sees [4,5] and contributes twice.
+    torch.testing.assert_close(
+        state.draft_context_shard,
+        torch.tensor([[10.0], [13.0]]),
+    )
 
 
 # --------------------------------------------------------------------------

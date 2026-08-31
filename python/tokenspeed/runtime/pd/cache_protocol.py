@@ -283,17 +283,27 @@ def build_cache_fields_by_producer_step(
 
     if pp_layer_window is not None:
         start, end = pp_layer_window
-        if not 0 <= start < end <= num_target_layers:
-            raise ValueError("PP layer window is outside the target layer range")
+        if not 0 <= start < end or end > max(num_target_layers, merged_layers):
+            raise ValueError("PP layer window is outside the merged cache range")
         # The plan may already be narrowed to the stage window (v2 physical
         # narrowing), in which case merged_layers reflects the window's last
         # layer + 1 rather than the full model — that's expected here.
-        return CacheProducerSchedule(
-            fields_by_step=tuple(
-                tuple(fields_by_layer.get(layer_id, ()))
-                for layer_id in range(start, end)
+        fields_by_step = [
+            tuple(fields_by_layer.get(layer_id, ()))
+            for layer_id in range(start, min(end, num_target_layers))
+        ]
+        if end > num_target_layers:
+            # All speculative-draft continuation layers execute after the
+            # target pipeline reaches its last stage.  Their cache becomes
+            # ready at one draft-final barrier, not one target-layer step.
+            fields_by_step.append(
+                tuple(
+                    field_id
+                    for layer_id in range(max(start, num_target_layers), end)
+                    for field_id in fields_by_layer.get(layer_id, ())
+                )
             )
-        )
+        return CacheProducerSchedule(tuple(fields_by_step))
 
     fields_by_step = [
         tuple(fields_by_layer.get(layer_id, ()))

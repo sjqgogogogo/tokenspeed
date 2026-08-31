@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -164,6 +166,23 @@ def test_pp_layer_partition_explicit_windows():
     assert pp_stage_windows(38, 4) == [(0, 10), (10, 20), (20, 29), (29, 38)]
 
 
+def test_pp_cache_windows_keep_dspark_layers_on_last_stage():
+    from tokenspeed.runtime.distributed.pp_stage import pp_cache_stage_windows
+
+    assert pp_cache_stage_windows(93, 5, 4) == [
+        (0, 24),
+        (24, 47),
+        (47, 70),
+        (70, 98),
+    ]
+    assert pp_cache_stage_windows(93, 5, 4, (20, 24, 24, 25)) == [
+        (0, 20),
+        (20, 44),
+        (44, 68),
+        (68, 98),
+    ]
+
+
 def test_pp_layer_partition_validation():
     from tokenspeed.runtime.distributed.pp_stage import pp_stage_windows
 
@@ -182,6 +201,32 @@ def test_mapping_accepts_pp_layer_partition():
     assert m.pp_layer_partition == (8, 11, 11, 8)
     m2 = Mapping(world_size=8, pp_size=4, attn_tp_size=2)
     assert m2.pp_layer_partition is None
+
+
+def _pp_disaggregation_args(algorithm: str):
+    return SimpleNamespace(
+        pipeline_parallel_size=4,
+        disaggregation_mode="prefill",
+        mapping=SimpleNamespace(has_attn_dp=False),
+        speculative_algorithm=algorithm,
+        draft_model_path_use_base=False,
+        disaggregation_layerwise_interval=0,
+        pp_layer_partition=None,
+        enforce_eager=False,
+        load_balance_method="round_robin",
+    )
+
+
+def test_pp_prefill_allows_external_dspark_only():
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    dspark = _pp_disaggregation_args("DSPARK")
+    ServerArgs.resolve_disaggregation(dspark)
+    assert dspark.enforce_eager
+
+    eagle = _pp_disaggregation_args("EAGLE3")
+    with pytest.raises(ValueError, match="external DSPARK"):
+        ServerArgs.resolve_disaggregation(eagle)
 
 
 def test_k3_attn_res_boundary_blocks_agree():
@@ -220,3 +265,23 @@ def test_pp_stage_state_block_residual_round_trip():
     rebuilt = PPStageState.from_tensors(tensors, ["hidden_states", "block_residual"])
     assert rebuilt.block_residual.shape == (3, 5, 8)
     assert rebuilt.hc_x is None
+
+
+def test_pp_stage_state_dspark_context_round_trip():
+    import torch
+
+    from tokenspeed.runtime.distributed.pp_stage import PPStageState
+
+    state = PPStageState(
+        hidden_states=torch.zeros(5, 8),
+        block_residual=torch.zeros(3, 5, 8),
+        draft_context_shard=torch.ones(5, 2),
+    )
+    tensors = state.tensors()
+    assert len(tensors) == 3
+    rebuilt = PPStageState.from_tensors(
+        tensors,
+        ["hidden_states", "block_residual", "draft_context_shard"],
+    )
+    assert rebuilt.draft_context_shard.shape == (5, 2)
+    assert torch.equal(rebuilt.draft_context_shard, torch.ones(5, 2))

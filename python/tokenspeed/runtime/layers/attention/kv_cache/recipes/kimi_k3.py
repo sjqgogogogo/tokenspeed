@@ -312,6 +312,16 @@ class KimiK3Recipe(CacheRecipe):
     @override
     def workspace_bytes(self) -> int:
         """KDA verify staging reserved outside the cache arena."""
+        # A PP cache-disaggregated Prefill worker never verifies speculative
+        # candidates locally: it only fills target/draft prompt cache and
+        # publishes the first candidate block to Decode. Reserving every KDA
+        # layer's verify workspace on all four PP stages wastes several GiB
+        # and disagrees with their physically narrowed layer windows.
+        mapping = getattr(self.server_args, "mapping", None)
+        if getattr(
+            self.server_args, "disaggregation_mode", None
+        ) == "prefill" and getattr(mapping, "has_pp", False):
+            return 0
         if self.server_args.speculative_algorithm is None:
             return 0
         if self.replay_kda:

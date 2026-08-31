@@ -30,8 +30,10 @@ concatenated, projected by ``context_proj``, and written into the draft's own
 latent KV cache; the block's queries are one anchor token plus mask tokens, and
 the intra-block token dependence comes entirely from the rank-256 Markov head.
 
-The draft borrows the target's embedding and lm_head, so the checkpoint's
-``embed_tokens`` copy is skipped and no ``lm_head`` is shipped at all.
+The draft normally borrows the target's embedding and lm_head.  Under PP the
+draft executes on the last stage while the target embedding lives on the first,
+so that stage keeps the checkpoint's frozen ``embed_tokens`` copy; no
+``lm_head`` is shipped and the target's last-stage head remains shared.
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     validate_k3_dspark_config,
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -57,6 +59,7 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.segmented_rmsnorm import segmented_rmsnorm
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
@@ -327,6 +330,22 @@ class K3DSparkModel(nn.Module):
             else None
         )
         self.register_buffer("_fc_norm_weight", None, persistent=False)
+        # A PP Prefill executes the draft only on its last stage, where the
+        # target embedding is intentionally absent.  The published checkpoint
+        # contains a frozen target embedding copy; retain a TP-sharded copy on
+        # that stage instead of trying to reach back to PP stage zero.
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                int(config.vocab_size),
+                hidden_size,
+                org_num_embeddings=int(config.vocab_size),
+                tp_rank=mapping.attn.tp_rank,
+                tp_size=mapping.attn.tp_size,
+                tp_group=mapping.attn.tp_group,
+            )
+            if mapping.has_pp and mapping.is_last_pp_rank
+            else None
+        )
 
         self.layers = nn.ModuleList(
             [
@@ -374,6 +393,121 @@ class K3DSparkModel(nn.Module):
             )
             target_hidden = target_hidden.flatten(-2)
         return self.context_norm(self.context_proj(target_hidden)[0])
+
+    @property
+    def pp_context_shard_width(self) -> int:
+        """Output width carried by one Attention-TP rank between PP stages."""
+        hidden_size = int(self.config.hidden_size)
+        tp_size = int(self.mapping.attn.tp_size)
+        if hidden_size % tp_size:
+            raise ValueError(
+                f"DSpark hidden size {hidden_size} is not divisible by TP {tp_size}"
+            )
+        return hidden_size // tp_size
+
+    def validate_pp_context_projection(self) -> None:
+        """Fail at startup unless the checkpoint can use split PP projection."""
+        if self.fc_norm is not None:
+            raise NotImplementedError(
+                "PP DSpark context projection does not yet support fc_norm"
+            )
+        hidden_size = int(self.config.target_hidden_size)
+        weight = getattr(self.context_proj, "weight", None)
+        expected = (
+            int(self.config.hidden_size),
+            self.num_context_features * hidden_size,
+        )
+        if (
+            weight is None
+            or weight.ndim != 2
+            or tuple(weight.shape) != expected
+            or weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            shape = tuple(weight.shape) if weight is not None else None
+            raise ValueError(
+                "PP DSpark requires an unquantized floating context_proj "
+                f"weight with shape {expected}, got {shape}"
+            )
+        _ = self.pp_context_shard_width
+
+    @torch.no_grad()
+    def accumulate_pp_target_hidden(
+        self,
+        accumulator: torch.Tensor,
+        target_hidden: torch.Tensor,
+        capture_index: int,
+    ) -> torch.Tensor:
+        """Add one target tap's context-projection slice to a PP accumulator.
+
+        ``context_proj([h0, ..., h4])`` is a sum over five input-column
+        blocks.  Its output rows are sharded over Attention TP, so matching TP
+        ranks send only ``hidden / tp`` values across PP boundaries.
+        """
+        self.validate_pp_context_projection()
+        if not 0 <= capture_index < self.num_context_features:
+            raise ValueError(
+                f"DSpark capture index {capture_index} is outside "
+                f"[0, {self.num_context_features})"
+            )
+        hidden_size = int(self.config.target_hidden_size)
+        shard_width = self.pp_context_shard_width
+        if target_hidden.ndim != 2 or target_hidden.shape[1] != hidden_size:
+            raise ValueError(
+                "DSpark PP target tap has shape "
+                f"{tuple(target_hidden.shape)}, expected [tokens, {hidden_size}]"
+            )
+        expected = (target_hidden.shape[0], shard_width)
+        if accumulator.shape != expected:
+            raise ValueError(
+                f"DSpark PP accumulator has shape {tuple(accumulator.shape)}, "
+                f"expected {expected}"
+            )
+        weight = self.context_proj.weight
+        row_start = int(self.mapping.attn.tp_rank) * shard_width
+        column_start = capture_index * hidden_size
+        sub_weight = weight[
+            row_start : row_start + shard_width,
+            column_start : column_start + hidden_size,
+        ]
+        torch.addmm(
+            accumulator,
+            target_hidden.to(dtype=sub_weight.dtype),
+            sub_weight.t(),
+            beta=1.0,
+            alpha=1.0,
+            out=accumulator,
+        )
+        return accumulator
+
+    @torch.no_grad()
+    def finalize_pp_target_context(self, accumulator: torch.Tensor) -> torch.Tensor:
+        """Gather a completed PP accumulator and apply the draft context norm."""
+        if accumulator.shape[-1] != self.pp_context_shard_width:
+            raise ValueError("DSpark PP accumulator width is inconsistent with TP")
+        context = (
+            all_gather(accumulator, self.mapping.attn.tp_group, dim=-1)
+            if self.mapping.attn.tp_size > 1
+            else accumulator
+        )
+        return self.context_norm(context)
+
+    @torch.no_grad()
+    def write_projected_context_kv(
+        self,
+        projected_context: torch.Tensor,
+        positions: torch.Tensor,
+        cache_locs: torch.Tensor,
+        token_to_kv_pool,
+    ) -> None:
+        """Write draft KV from a context already projected and normalized."""
+        if projected_context.shape[-1] != int(self.config.hidden_size):
+            raise ValueError("projected DSpark context has the wrong hidden width")
+        self.write_context_kv(
+            projected_context,
+            positions,
+            cache_locs,
+            token_to_kv_pool,
+        )
 
     def _finalize_hidden(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
@@ -501,7 +635,9 @@ class K3DSparkModel(nn.Module):
 
         for name, loaded_weight in weights:
             name = name.removeprefix("model.")
-            if name.startswith(K3_DSPARK_SKIPPED_WEIGHT_PREFIXES):
+            if name.startswith("embed_tokens.") and self.embed_tokens is not None:
+                pass
+            elif name.startswith(K3_DSPARK_SKIPPED_WEIGHT_PREFIXES):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue

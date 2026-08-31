@@ -2716,6 +2716,10 @@ class KimiLinearModel(nn.Module):
         self._dflash_incremental_callback = None
         self._dflash_slot_bufs = None
         self._dflash_capture_idx_map: dict[int, int] = {}
+        # Set only for PP Prefill + external K3 DSpark.  Kept as a plain
+        # reference (not a registered child module): the draft ModelRunner owns
+        # its weights and lifecycle.
+        object.__setattr__(self, "_pp_dspark_projector", None)
 
     def _refresh_dflash_capture_fallback(self) -> None:
         """Mark AttnRes consumers that need split execution."""
@@ -2757,10 +2761,20 @@ class KimiLinearModel(nn.Module):
                 break
         if dtype is None:
             dtype = torch.bfloat16
-        return [
+        spec = [
             ("hidden_states", (num_tokens, hidden), dtype),
             ("block_residual", (valid_blocks, num_tokens, hidden), dtype),
         ]
+        projector = getattr(self, "_pp_dspark_projector", None)
+        if projector is not None:
+            spec.append(
+                (
+                    "draft_context_shard",
+                    (num_tokens, projector.pp_context_shard_width),
+                    projector.context_dtype,
+                )
+            )
+        return spec
 
     def _dspark_capture_stream(
         self,
@@ -2822,8 +2836,27 @@ class KimiLinearModel(nn.Module):
             inbound_blocks = pp_inbound.block_residual
             block_residual[: inbound_blocks.size(0)].copy_(inbound_blocks)
 
+        pp_dspark = getattr(self, "_pp_dspark_projector", None)
+        draft_context_shard = None
+        if pp_dspark is not None:
+            if pp_inbound is None:
+                draft_context_shard = hidden_states.new_zeros(
+                    (hidden_states.shape[0], pp_dspark.pp_context_shard_width),
+                    dtype=pp_dspark.context_dtype,
+                )
+            else:
+                draft_context_shard = pp_inbound.draft_context_shard
+                if draft_context_shard is None:
+                    raise RuntimeError(
+                        "PP DSpark stage received no projected context accumulator"
+                    )
+                if draft_context_shard.shape[0] != hidden_states.shape[0]:
+                    raise RuntimeError(
+                        "PP DSpark accumulator rows do not match the stage input"
+                    )
+
         capture_layers = self.layers_to_capture
-        capture_dflash = bool(capture_layers)
+        capture_dflash = bool(capture_layers) and pp_dspark is None
         capture_eagle3 = bool(self.eagle3_layers_to_capture)
         aux_hidden_states: list[torch.Tensor] | None = (
             [] if capture_dflash or capture_eagle3 else None
@@ -2835,7 +2868,14 @@ class KimiLinearModel(nn.Module):
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, out_cache_loc, block_residual
             )
-            if capture_dflash and layer_idx in capture_layers:
+            if pp_dspark is not None and layer_idx in self._dflash_capture_idx_map:
+                assert draft_context_shard is not None
+                pp_dspark.accumulate_pp_target_hidden(
+                    draft_context_shard,
+                    prefix_sum,
+                    self._dflash_capture_idx_map[layer_idx],
+                )
+            elif capture_dflash and layer_idx in capture_layers:
                 captured = self._dspark_capture_stream(
                     layer_idx, prefix_sum, block_residual
                 )
@@ -2862,6 +2902,7 @@ class KimiLinearModel(nn.Module):
                 PPStageState(
                     hidden_states=prefix_sum,
                     block_residual=block_residual[:valid_blocks],
+                    draft_context_shard=draft_context_shard,
                 ),
                 None,
             )
@@ -2874,6 +2915,11 @@ class KimiLinearModel(nn.Module):
             num_blocks,
             out_norm=self.norm,
         )
+        if pp_dspark is not None:
+            assert draft_context_shard is not None
+            aux_hidden_states = [
+                pp_dspark.finalize_pp_target_context(draft_context_shard)
+            ]
         return hidden_states, aux_hidden_states
 
 
@@ -2964,6 +3010,36 @@ class KimiLinearForCausalLM(BaseCausalLM):
             "DFLASH/DSpark target capture: layers=%s stream=%s",
             tuple(self.model.layers_to_capture),
             stream,
+        )
+
+    def configure_pp_dspark(self, draft_model: nn.Module) -> None:
+        """Wire a K3 DSpark context projector through the target PP stages."""
+        if not self.mapping.has_pp:
+            return
+        target_layer_ids = list(getattr(draft_model.config, "target_layer_ids", ()))
+        if not target_layer_ids:
+            raise ValueError("PP DSpark draft must declare target_layer_ids")
+        aux_stream = str(
+            getattr(draft_model.config, "aux_hidden_stream", "prefix")
+        ).lower()
+        if aux_stream != "prefix":
+            raise NotImplementedError(
+                "PP K3 DSpark initially supports only aux_hidden_stream='prefix'"
+            )
+        if getattr(draft_model, "fc_norm", None) is not None:
+            raise NotImplementedError("PP K3 DSpark does not yet support fc_norm")
+        if draft_model.mapping.attn.tp_size != self.mapping.attn.tp_size:
+            raise ValueError("PP K3 target and DSpark draft must use the same TP size")
+        if draft_model.mapping.attn.tp_rank != self.mapping.attn.tp_rank:
+            raise ValueError("PP K3 target and DSpark draft must use the same TP rank")
+        draft_model.validate_pp_context_projection()
+        self.set_dflash_layers_to_capture(target_layer_ids)
+        self.set_dflash_aux_hidden_stream(aux_stream)
+        object.__setattr__(self.model, "_pp_dspark_projector", draft_model)
+        logger.info(
+            "PP DSpark projected context enabled: taps=%s shard_width=%s",
+            tuple(target_layer_ids),
+            draft_model.pp_context_shard_width,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
@@ -3381,6 +3457,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Kimi-K3 encoder-only mode cannot capture target hidden states."
             )
         self.language_model.set_dflash_aux_hidden_stream(stream)
+
+    def configure_pp_dspark(self, draft_model: nn.Module) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode cannot configure PP DSpark."
+            )
+        self.language_model.configure_pp_dspark(draft_model)
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         if self.language_model is None:

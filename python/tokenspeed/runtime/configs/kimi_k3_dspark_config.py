@@ -37,7 +37,8 @@ from typing import Any
 from transformers.configuration_utils import PretrainedConfig
 
 # The checkpoint ships an embed_tokens copy of the frozen target embedding and
-# a training-only confidence head. Neither is instantiated at serving time.
+# a training-only confidence head. Aggregate serving skips both; PP Prefill
+# retains the embedding only on the last stage, where the draft executes.
 K3_DSPARK_SKIPPED_WEIGHT_PREFIXES = ("embed_tokens.", "lm_head.", "confidence_head.")
 
 SUPPORTED_MARKOV_HEAD_TYPES = ("vanilla",)

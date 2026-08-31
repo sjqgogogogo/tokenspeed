@@ -6,9 +6,7 @@ import sys
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
-from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout
-
-import torch
+from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout  # noqa: E402
 
 
 def _plan(num_lcm_blocks: int, *, tp_size: int = 8):
@@ -234,3 +232,17 @@ def test_k3_binding_utilization_with_real_bf16_draft_geometry():
     widened = merged.capacity_report()
     assert abs(widened["full_attention"]["binding_utilization"] - 1.0) < 1e-3
     assert abs(widened["linear_attention_0"]["binding_utilization"] - 0.6224) < 1e-3
+
+
+def test_pp4_assigns_all_five_dspark_cache_layers_to_last_stage() -> None:
+    from tokenspeed.runtime.distributed.pp_stage import pp_cache_stage_windows
+
+    merged = kimi_tp8_layout(draft_layers=5)[2].bind(2)
+    windows = pp_cache_stage_windows(93, 5, 4)
+    plans = [merged.narrow_to_layers(start, end) for start, end in windows]
+    fields_by_stage = [{field.field_id for field in plan.fields} for plan in plans]
+
+    draft_fields = {f"layer.{layer}.latent_kv" for layer in range(93, 98)}
+    assert all(not (fields & draft_fields) for fields in fields_by_stage[:-1])
+    assert draft_fields <= fields_by_stage[-1]
+    assert set().union(*fields_by_stage) == {field.field_id for field in merged.fields}

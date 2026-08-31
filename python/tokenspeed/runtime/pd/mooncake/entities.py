@@ -61,6 +61,10 @@ class KVArgs:
     # Prefill chunk-pipeline: this rank's [start, end) global layer window.
     # None when PP is off (the rank owns every layer).
     pp_layer_window: tuple[int, int] | None = None
+    # Cache-layer counts per Prefill stage.  Usually this matches the target
+    # model's PP partition; with speculative decoding the last count also owns
+    # the draft continuation layers.
+    pp_layer_partition: tuple[int, ...] | None = None
     # Full-model logical contract for the PD wire when the local arena/plan
     # is narrowed to a stage window; None means cache_layout is already it.
     wire_cache_layout: CacheTransferContract | None = None

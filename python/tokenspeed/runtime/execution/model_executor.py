@@ -429,11 +429,23 @@ class ModelExecutor:
             max_bs,
             self.device,
         )
-        if self.config.spec_algo is not None:
+        draft_execution_enabled = self.config.spec_algo is not None and (
+            self.config.pp_size == 1 or self.config.pp_rank == self.config.pp_size - 1
+        )
+        if draft_execution_enabled:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
             # already happened in create_model_runner, right after both
             # models loaded. Here only the drafter instance is built and
             # wired to the target.
+            if (
+                draft_model_runner is None
+                or draft_attn_backend is None
+                or draft_token_to_kv_pool is None
+            ):
+                raise RuntimeError(
+                    "the draft-executing PP stage requires a draft model, "
+                    "attention backend, and cache view"
+                )
             DrafterImpl = get_drafter_impl(config.spec_algo, draft_model_runner.model)
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,

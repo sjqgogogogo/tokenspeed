@@ -100,6 +100,14 @@ def _wire_draft_to_target_model(
             draft_model_runner.model_config.hf_config
         )
         model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
+    if server_args.speculative_algorithm == "DSPARK" and server_args.mapping.has_pp:
+        configure = getattr(model_runner.model, "configure_pp_dspark", None)
+        if configure is None:
+            raise NotImplementedError(
+                "PP DSPARK Prefill requires a target model with "
+                "configure_pp_dspark support"
+            )
+        configure(draft_model_runner.model)
 
 
 def create_model_runner(
