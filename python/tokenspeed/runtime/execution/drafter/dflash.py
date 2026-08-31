@@ -1100,6 +1100,14 @@ class DFlash(BaseDrafter):
             self.spec_num_tokens,
             out=current_tokens,
         )
+        if self.input_buffers.all_extends_mid_chunk and self.dp_size == 1:
+            # Every prompt row continues in a later chunk. Target-derived
+            # context KV above is required, but a DSpark candidate block would
+            # be discarded before verification. Preserve a valid future-input
+            # shape without running the five-layer block draft.
+            next_tokens = self.next_tokens_buf[:bs]
+            next_tokens.copy_(current_tokens.unsqueeze(1).expand_as(next_tokens))
+            return next_tokens
         return self.draft(current_tokens)
 
     def _run_overlap(

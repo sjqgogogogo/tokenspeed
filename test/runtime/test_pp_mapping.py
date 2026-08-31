@@ -203,14 +203,14 @@ def test_mapping_accepts_pp_layer_partition():
     assert m2.pp_layer_partition is None
 
 
-def _pp_disaggregation_args(algorithm: str):
+def _pp_disaggregation_args(algorithm: str, *, layerwise_interval: int = 0):
     return SimpleNamespace(
         pipeline_parallel_size=4,
         disaggregation_mode="prefill",
         mapping=SimpleNamespace(has_attn_dp=False),
         speculative_algorithm=algorithm,
         draft_model_path_use_base=False,
-        disaggregation_layerwise_interval=0,
+        disaggregation_layerwise_interval=layerwise_interval,
         pp_layer_partition=None,
         enforce_eager=False,
         load_balance_method="round_robin",
@@ -223,6 +223,10 @@ def test_pp_prefill_allows_external_dspark_only():
     dspark = _pp_disaggregation_args("DSPARK")
     ServerArgs.resolve_disaggregation(dspark)
     assert dspark.enforce_eager
+
+    layerwise = _pp_disaggregation_args("DSPARK", layerwise_interval=4)
+    ServerArgs.resolve_disaggregation(layerwise)
+    assert layerwise.enforce_eager
 
     eagle = _pp_disaggregation_args("EAGLE3")
     with pytest.raises(ValueError, match="external DSPARK"):

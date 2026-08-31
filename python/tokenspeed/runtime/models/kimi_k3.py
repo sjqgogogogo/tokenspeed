@@ -3036,6 +3036,9 @@ class KimiLinearForCausalLM(BaseCausalLM):
         self.set_dflash_layers_to_capture(target_layer_ids)
         self.set_dflash_aux_hidden_stream(aux_stream)
         object.__setattr__(self.model, "_pp_dspark_projector", draft_model)
+        draft_model.prepare_pp_stage(
+            (self.model.pp_start_layer, self.model.pp_end_layer)
+        )
         logger.info(
             "PP DSpark projected context enabled: taps=%s shard_width=%s",
             tuple(target_layer_ids),

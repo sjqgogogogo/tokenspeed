@@ -351,6 +351,10 @@ class EventLoop:
             if (
                 server_args.speculative_algorithm is not None
                 and server_args.disaggregation_layerwise_interval > 0
+                and (
+                    not server_args.mapping.has_pp
+                    or server_args.mapping.is_last_pp_rank
+                )
                 and not getattr(
                     self.model_executor.drafter,
                     "supports_pd_layerwise_finalization",

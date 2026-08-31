@@ -11,6 +11,7 @@ recurrent KDA state still gets committed after a DSpark verify.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -19,6 +20,7 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     _should_update_mamba_state_after_mtp_verify,
 )
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
+from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.models.dspark import VanillaMarkov
@@ -343,6 +345,31 @@ def test_proposals_are_valid_token_ids() -> None:
         torch.zeros((1, spec), dtype=torch.int32),
     )
     assert int(out.min()) >= 0
+
+
+def test_all_mid_chunk_prefill_updates_cache_without_running_block_draft() -> None:
+    drafter = DFlash.__new__(DFlash)
+    drafter.spec_num_tokens = 4
+    drafter.dp_size = 1
+    drafter.input_buffers = SimpleNamespace(all_extends_mid_chunk=True)
+    drafter.block_ids_buf = torch.zeros((2, 3), dtype=torch.int32)
+    drafter.next_tokens_buf = torch.empty((2, 4), dtype=torch.int32)
+    drafter._update_native_cache_from_target = mock.Mock()
+    drafter.draft = mock.Mock(
+        side_effect=AssertionError("mid-chunk prefill must not draft candidates")
+    )
+    output_tokens = torch.tensor([11, 13], dtype=torch.int32)
+
+    next_tokens = DFlash.run(
+        drafter,
+        SimpleNamespace(bs=2, num_extends=2),
+        logits_output=object(),
+        output_tokens=output_tokens,
+        accept_lengths=torch.ones(2, dtype=torch.int32),
+    )
+
+    drafter._update_native_cache_from_target.assert_called_once()
+    assert next_tokens.tolist() == [[11, 11, 11, 11], [13, 13, 13, 13]]
 
 
 # --------------------------------------------------------------------------

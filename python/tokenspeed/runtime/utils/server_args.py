@@ -800,13 +800,12 @@ class ServerArgs:
                     self.disaggregation_mode == "prefill"
                     and self.speculative_algorithm == "DSPARK"
                     and not self.draft_model_path_use_base
-                    and self.disaggregation_layerwise_interval == 0
                 )
                 if not pp_dspark_prefill:
                     raise ValueError(
                         "--pipeline-parallel-size > 1 supports speculative "
                         "decoding only for an external DSPARK draft on a "
-                        "Prefill worker with --disaggregation-layerwise-interval 0"
+                        "Prefill worker"
                     )
             if (
                 self.pp_layer_partition is not None

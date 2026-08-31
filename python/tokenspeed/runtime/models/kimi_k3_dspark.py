@@ -330,6 +330,7 @@ class K3DSparkModel(nn.Module):
             else None
         )
         self.register_buffer("_fc_norm_weight", None, persistent=False)
+        self._pp_context_capture_columns: dict[int, int] | None = None
         # A PP Prefill executes the draft only on its last stage, where the
         # target embedding is intentionally absent.  The published checkpoint
         # contains a frozen target embedding copy; retain a TP-sharded copy on
@@ -413,9 +414,17 @@ class K3DSparkModel(nn.Module):
             )
         hidden_size = int(self.config.target_hidden_size)
         weight = getattr(self.context_proj, "weight", None)
+        capture_columns = getattr(self, "_pp_context_capture_columns", None)
         expected = (
-            int(self.config.hidden_size),
-            self.num_context_features * hidden_size,
+            (
+                self.pp_context_shard_width,
+                len(capture_columns) * hidden_size,
+            )
+            if capture_columns is not None
+            else (
+                int(self.config.hidden_size),
+                self.num_context_features * hidden_size,
+            )
         )
         if (
             weight is None
@@ -429,6 +438,73 @@ class K3DSparkModel(nn.Module):
                 f"weight with shape {expected}, got {shape}"
             )
         _ = self.pp_context_shard_width
+
+    @torch.no_grad()
+    def prepare_pp_stage(self, target_layer_window: tuple[int, int]) -> None:
+        """Retain only this PP stage's context slices and execution weights.
+
+        The checkpoint is loaded in full first so the ordinary loader remains
+        unchanged. Before cache profiling, every stage crops ``context_proj``
+        to its Attention-TP output rows and locally owned target taps. Only the
+        last stage keeps the five-layer draft network and Markov head.
+        """
+        if not self.mapping.has_pp:
+            return
+        if getattr(self, "_pp_context_capture_columns", None) is not None:
+            raise RuntimeError("DSpark PP stage weights were already prepared")
+        self.validate_pp_context_projection()
+        start, end = target_layer_window
+        if not 0 <= start < end <= int(self.config.target_num_hidden_layers):
+            raise ValueError(f"invalid DSpark target PP layer window {(start, end)}")
+        local_capture_indices = [
+            capture_index
+            for capture_index, layer_id in enumerate(self.config.target_layer_ids)
+            if start <= int(layer_id) < end
+        ]
+        hidden_size = int(self.config.target_hidden_size)
+        shard_width = self.pp_context_shard_width
+        row_start = int(self.mapping.attn.tp_rank) * shard_width
+        full_weight = self.context_proj.weight.detach()
+        row_shard = full_weight[row_start : row_start + shard_width]
+        if local_capture_indices:
+            local_weight = torch.cat(
+                [
+                    row_shard[
+                        :,
+                        capture_index * hidden_size : (capture_index + 1) * hidden_size,
+                    ]
+                    for capture_index in local_capture_indices
+                ],
+                dim=1,
+            ).contiguous()
+        else:
+            local_weight = row_shard.new_empty((shard_width, 0))
+        self.context_proj.weight = nn.Parameter(local_weight, requires_grad=False)
+        self._pp_context_capture_columns = {
+            capture_index: local_index
+            for local_index, capture_index in enumerate(local_capture_indices)
+        }
+
+        if not self.mapping.is_last_pp_rank:
+            # These modules never execute before the target pipeline's last
+            # stage. Dropping them here returns their storage before KV-cache
+            # memory is profiled.
+            self.layers = nn.ModuleList()
+            self.final_norm = None
+            self.markov_head = None
+            self.context_norm = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info(
+            "PP DSpark stage weights: target_window=%s local_taps=%s "
+            "context_weight=%s executes_draft=%s",
+            (start, end),
+            tuple(
+                self.config.target_layer_ids[index] for index in local_capture_indices
+            ),
+            tuple(self.context_proj.weight.shape),
+            self.mapping.is_last_pp_rank,
+        )
 
     @torch.no_grad()
     def accumulate_pp_target_hidden(
@@ -463,8 +539,18 @@ class K3DSparkModel(nn.Module):
                 f"expected {expected}"
             )
         weight = self.context_proj.weight
-        row_start = int(self.mapping.attn.tp_rank) * shard_width
-        column_start = capture_index * hidden_size
+        capture_columns = getattr(self, "_pp_context_capture_columns", None)
+        if capture_columns is None:
+            row_start = int(self.mapping.attn.tp_rank) * shard_width
+            column_index = capture_index
+        else:
+            if capture_index not in capture_columns:
+                raise ValueError(
+                    f"DSpark capture {capture_index} is not owned by this PP stage"
+                )
+            row_start = 0
+            column_index = capture_columns[capture_index]
+        column_start = column_index * hidden_size
         sub_weight = weight[
             row_start : row_start + shard_width,
             column_start : column_start + hidden_size,
@@ -482,6 +568,8 @@ class K3DSparkModel(nn.Module):
     @torch.no_grad()
     def finalize_pp_target_context(self, accumulator: torch.Tensor) -> torch.Tensor:
         """Gather a completed PP accumulator and apply the draft context norm."""
+        if self.context_norm is None:
+            raise RuntimeError("only the last PP stage may finalize DSpark context")
         if accumulator.shape[-1] != self.pp_context_shard_width:
             raise ValueError("DSpark PP accumulator width is inconsistent with TP")
         context = (
@@ -684,8 +772,7 @@ class K3DSparkModel(nn.Module):
         missing = sorted(set(params_dict) - loaded)
         if missing:
             raise ValueError(
-                f"K3 DSpark checkpoint is missing {len(missing)} weights: "
-                f"{missing[:8]}"
+                f"K3 DSpark checkpoint is missing {len(missing)} weights: {missing[:8]}"
             )
         self.post_load_weights()
 

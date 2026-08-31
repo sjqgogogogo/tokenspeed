@@ -132,13 +132,17 @@ def _pp_projection_model(weight: torch.Tensor, tp_rank: int):
     model.config = SimpleNamespace(
         hidden_size=4,
         target_hidden_size=4,
+        target_num_hidden_layers=4,
+        target_layer_ids=[0, 2],
     )
     model.mapping = SimpleNamespace(
+        has_pp=False,
+        is_last_pp_rank=True,
         attn=SimpleNamespace(
             tp_size=2,
             tp_rank=tp_rank,
             tp_group=(0, 1),
-        )
+        ),
     )
     model.num_context_features = 2
     model.context_proj = SimpleNamespace(weight=torch.nn.Parameter(weight))
@@ -169,6 +173,32 @@ def test_pp_context_projection_accumulates_exact_tp_row_shards(monkeypatch) -> N
         lambda value, group, dim: torch.cat(shards, dim=dim),
     )
     torch.testing.assert_close(model.finalize_pp_target_context(shards[0]), expected)
+
+
+def test_pp_stage_prunes_context_weight_and_nonfinal_draft_modules() -> None:
+    weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    model = _pp_projection_model(weight, tp_rank=0)
+    model.mapping.has_pp = True
+    model.mapping.is_last_pp_rank = False
+    model.layers = torch.nn.ModuleList([torch.nn.Linear(1, 1)])
+    model.final_norm = torch.nn.LayerNorm(4)
+    model.markov_head = torch.nn.Linear(1, 1)
+
+    model.prepare_pp_stage((0, 2))
+
+    assert model._pp_context_capture_columns == {0: 0}
+    torch.testing.assert_close(model.context_proj.weight, weight[:2, :4])
+    assert len(model.layers) == 0
+    assert model.final_norm is None
+    assert model.markov_head is None
+    assert model.context_norm is None
+    hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    accumulator = torch.zeros(3, 2)
+    model.accumulate_pp_target_hidden(accumulator, hidden, 0)
+    torch.testing.assert_close(
+        accumulator,
+        torch.nn.functional.linear(hidden, weight[:2, :4]),
+    )
 
 
 def test_yarn_scaling_is_translated_for_get_rope() -> None:
