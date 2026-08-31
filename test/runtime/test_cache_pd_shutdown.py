@@ -224,6 +224,15 @@ def test_dp_idle_forward_still_dispatches_remote_prefill_control_op(
     loop._batch_logger = SimpleNamespace(
         log_dispatch=lambda op, _stats: loop.trace.append(("log_batch", op))
     )
+    loop._gather_sampling_params = lambda op: (
+        loop.trace.append(("sampling", op)),
+        [],
+    )[1]
+    loop._gather_grammar_state = lambda op: (
+        loop.trace.append(("grammar", op)),
+        None,
+    )[1]
+    loop._dispatch_depends_on_pending_commit = lambda _op, _grammar: False
     loop._dispatch_forward = lambda op, *_args, **_kwargs: (
         loop.trace.append(("dispatch_control", op)),
         (None, None),

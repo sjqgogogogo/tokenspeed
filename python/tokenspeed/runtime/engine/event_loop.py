@@ -1152,16 +1152,17 @@ class EventLoop:
             # advance_scheduler call at the tail.
             request_changes = []
             forward_op = None
-            # An idle round (freeze or DP idle) runs no dispatch and — as
-            # before the paths were unified — no kv-transfer event poll.
-            idle_round = False
+            # A deliberate pause freezes the whole scheduling lifecycle. DP
+            # idle is different: it substitutes only the model forward, while
+            # control-only dispatch and asynchronous progress still run below.
+            paused_round = False
 
             if self._pause.forward_blocked:
                 # Freeze: dispatched forwards can't be un-launched; commit them
                 # all before idling.
                 request_changes.extend(self._drain_in_flight(in_flight))
                 self._pause_hooks.paused_idle_step()
-                idle_round = True
+                paused_round = True
             else:
                 execution_plan = self.scheduler.next_execution_plan()
                 pages_to_zero = execution_plan.pages_to_zero
@@ -1193,11 +1194,10 @@ class EventLoop:
                 # consistent with waiting/pages).
                 self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
-                # DP sync: all ranks must participate even when idle. Checked
-                # right after forward_op is derived so an idle round commits
-                # pending steps and skips the per-batch work below (the
-                # gathers are local and read-only, so ordering them after the
-                # collective is rank-safe).
+                # DP sync: all ranks must participate even when they have no
+                # local model work. An idle model forward substitutes only for
+                # model execution; a control-only forward_op remains eligible
+                # for the common dispatch path below.
                 dp_metadata = None
                 if self.has_dp:
                     dp_metadata = self._dp_sync_and_check(forward_op)
@@ -1209,43 +1209,16 @@ class EventLoop:
                                 dp_metadata,
                             )
                         )
-                        # A Decode-side remote-prefill admission is a
-                        # control-only forward op: scheduler planning already
-                        # allocated and pinned its destination pages, but the
-                        # op itself runs no model collectives. The idle model
-                        # forward above substitutes only for model work; still
-                        # dispatch the control op so it publishes the manifest
-                        # instead of stranding the request in remote Prefilling.
-                        if forward_op is not None and not (
+                        if forward_op is not None and (
                             self._forward_dispatcher.produces_model_output(
                                 forward_op
                             )
                         ):
-                            self._mark_stats_scheduled(forward_op)
-                            self._batch_logger.log_dispatch(forward_op, stats)
-                            pending, on_first_token = self._dispatch_forward(
-                                forward_op,
-                                [],
-                                dp_metadata=dp_metadata,
-                                grammar_inputs=None,
-                                cache_zero_future=cache_zero_future,
-                            )
-                            if pending is not None or on_first_token is not None:
-                                raise RuntimeError(
-                                    "DP-idle control forward unexpectedly "
-                                    "produced model output"
-                                )
-                        # PD progress is local to this DP's Attention-TP group.
-                        # Keep consuming its control-plane events even when this
-                        # rank only joins a peer DP's model step with an idle
-                        # forward; otherwise bootstrap/completion events wait
-                        # until every DP happens to become idle together.
-                        request_changes.extend(
-                            self._pd_hooks.poll_transfer_events()
-                        )
-                        idle_round = True
+                            # Defensive zero-token model op: the idle forward
+                            # already supplied this rank's collective work.
+                            forward_op = None
 
-            if not idle_round:
+            if not paused_round:
                 # Nothing to dispatch (an empty plan) still reaches the drain
                 # below — only this dispatch half is skipped.
                 if forward_op is not None:
