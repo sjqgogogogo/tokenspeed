@@ -853,13 +853,21 @@ def create_attn_components(
         cache_family,
         draft_cache_family,
     )
+    # K3 PP stages intentionally retain different target/draft weights and
+    # different cache planes. Preserve each rank's local byte budget here;
+    # KimiK3Recipe converts it to a local parent count and MIN-reduces that
+    # count, which is tighter than combining the world's minimum free bytes
+    # with a different stage's maximum resident-parent size.
+    profile_k3_pp_locally = cache_family == "kimi_k3" and server_args.mapping.has_pp
     cache_memory = profile_available_cache_memory_bytes(
         attn_config=config,
         gpu_id=gpu_id,
-        tp_size=server_args.mapping.world_size,
+        tp_size=(1 if profile_k3_pp_locally else server_args.mapping.world_size),
         gpu_memory_utilization=server_args.gpu_memory_utilization,
         total_gpu_memory=gpu_memory,
-        world_group=server_args.mapping.world_group,
+        world_group=(
+            None if profile_k3_pp_locally else server_args.mapping.world_group
+        ),
     )
     cache_setup = prepare_cache_setup(
         family=cache_family,

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
+
+import torch
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
@@ -246,3 +249,47 @@ def test_pp4_assigns_all_five_dspark_cache_layers_to_last_stage() -> None:
     assert all(not (fields & draft_fields) for fields in fields_by_stage[:-1])
     assert draft_fields <= fields_by_stage[-1]
     assert set().union(*fields_by_stage) == {field.field_id for field in merged.fields}
+
+
+def test_pp4_capacity_uses_local_resident_stage_not_full_model() -> None:
+    from tokenspeed.runtime.distributed.pp_stage import pp_cache_stage_windows
+
+    recipe, _, layout = kimi_tp8_layout(draft_layers=5)
+    recipe.server_args.mapping = SimpleNamespace(
+        has_pp=True,
+        pp_size=4,
+        pp_rank=3,
+        pp_layer_partition=None,
+    )
+    probe = layout.bind(1)
+    windows = pp_cache_stage_windows(93, 5, 4)
+    start, end = windows[3]
+    resident = probe.narrow_to_layers(start, end).resident_block_bytes
+    assert resident < layout.lcm_block_bytes
+    recipe.cache_budget_bytes = resident * 100
+
+    assert recipe.num_lcm_blocks(layout) == 99
+
+
+def test_pp_parent_count_uses_distributed_minimum(monkeypatch) -> None:
+    recipe, _, _ = kimi_tp8_layout(draft_layers=5)
+    recipe.server_args.mapping = SimpleNamespace(
+        has_pp=True,
+        world_group=tuple(range(4)),
+    )
+    calls = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.pg_manager.get_process_group",
+        lambda backend, group: calls.append((backend, group)) or object(),
+    )
+
+    def reduce_min(value, *, op, group):
+        del op, group
+        value.fill_(73)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_min)
+
+    assert recipe._uniform_pp_parent_count(99) == 73
+    assert calls == [("gloo", tuple(range(4)))]

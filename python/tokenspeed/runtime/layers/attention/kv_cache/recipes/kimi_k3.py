@@ -365,9 +365,66 @@ class KimiK3Recipe(CacheRecipe):
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
+    def _budget_parent_bytes(self, layout: CacheLayout) -> int:
+        """Physical parent bytes owned by this PP stage.
+
+        The logical K3 layout covers target and draft layers so every stage
+        shares one page-id space. PP later drops non-local planes physically;
+        sizing parent count from the logical full-model byte width would keep
+        that dropped memory as unused headroom. Size from this stage's resident
+        planes; :meth:`num_lcm_blocks` MIN-reduces the resulting parent count
+        so every rank still publishes one uniform capacity.
+        """
+        mapping = getattr(self.server_args, "mapping", None)
+        if not getattr(mapping, "has_pp", False):
+            return layout.lcm_block_bytes
+
+        from tokenspeed.runtime.distributed.pp_stage import pp_cache_stage_windows
+
+        windows = pp_cache_stage_windows(
+            self.num_target_layers,
+            self.num_draft_layers,
+            mapping.pp_size,
+            mapping.pp_layer_partition,
+        )
+        logical_probe = layout.bind(1)
+        start, end = windows[mapping.pp_rank]
+        resident = int(
+            logical_probe.narrow_to_layers(start, end).resident_block_bytes or 0
+        )
+        if resident <= 0:
+            raise ValueError("Kimi-K3 PP cache stage owns no resident bytes")
+        return resident
+
+    def _uniform_pp_parent_count(self, local_count: int) -> int:
+        """Take the rank-uniform minimum affordable PP parent count."""
+        mapping = getattr(self.server_args, "mapping", None)
+        if not getattr(mapping, "has_pp", False):
+            return local_count
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            return local_count
+
+        from tokenspeed.runtime.distributed import pg_manager
+
+        count = torch.tensor(local_count, dtype=torch.int64)
+        torch.distributed.all_reduce(
+            count,
+            op=torch.distributed.ReduceOp.MIN,
+            group=pg_manager.get_process_group("gloo", mapping.world_group),
+        )
+        return int(count.item())
+
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        num_lcm_blocks = super().num_lcm_blocks(layout)
+        usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
+        budgeted = usable_bytes // self._budget_parent_bytes(layout) - 1
+        num_lcm_blocks = self._capped_parents(
+            self._uniform_pp_parent_count(budgeted),
+            parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
+        )
         token_limit = self.token_limit
         if token_limit is None:
             return num_lcm_blocks
