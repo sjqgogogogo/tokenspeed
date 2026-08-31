@@ -111,6 +111,18 @@ def _draft_idle_global_num_tokens_for_step(
 PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 
 
+def _should_prewarm_comm_states(config) -> bool:
+    """Whether eager startup may issue a synthetic decode-shaped forward.
+
+    Pipeline-parallel workers are Prefill-only and own only a target-layer
+    window.  A decode/verify dummy forward is neither representative nor
+    structurally valid there (hybrid KDA replay, in particular, expects the
+    complete layer grouping).  Their communication state initializes on the
+    first real extend instead.
+    """
+    return bool(config.enforce_eager and config.pp_size == 1)
+
+
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
     """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
 
@@ -538,11 +550,15 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
         )
-        # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
-        if config.enforce_eager:
+        # Eager DP warmup can be asymmetric; prewarm RSAG under uniform dummy
+        # inputs. PP workers are Prefill-only and cannot execute this synthetic
+        # decode/verify shape over a stage-local KDA layer window.
+        if _should_prewarm_comm_states(config):
             logger.info("Prewarming Triton RSAG communication states")
             self.forward_step.prewarm_comm_states(batch_sizes=(1,))
             logger.info("Finished prewarming Triton RSAG communication states")
+        elif config.enforce_eager and config.pp_size > 1:
+            logger.info("Skipping decode-shaped communication prewarm under PP")
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
         # the decode wrapper above; borrows the decode capture stream so all

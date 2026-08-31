@@ -229,6 +229,20 @@ def test_pp_prefill_allows_external_dspark_only():
         ServerArgs.resolve_disaggregation(eagle)
 
 
+def test_decode_shaped_comm_prewarm_is_disabled_under_pp():
+    from tokenspeed.runtime.execution.model_executor import (
+        _should_prewarm_comm_states,
+    )
+
+    assert _should_prewarm_comm_states(SimpleNamespace(enforce_eager=True, pp_size=1))
+    assert not _should_prewarm_comm_states(
+        SimpleNamespace(enforce_eager=True, pp_size=4)
+    )
+    assert not _should_prewarm_comm_states(
+        SimpleNamespace(enforce_eager=False, pp_size=1)
+    )
+
+
 def test_k3_attn_res_boundary_blocks_agree():
     """K3 PP wire contract: the upstream stage ships exactly the snapshot rows
     the downstream stage expects, at every cut point and block size (the two
