@@ -140,6 +140,7 @@ class DFlash(BaseDrafter):
 
         self.device = torch.device(draft_model_runner.device)
         self.model = draft_model_runner.model
+        self.dp_size = int(draft_model_runner.mapping.attn.dp_size)
         self.attention_kind = getattr(self.model, "attention_kind", "qwen_mha")
 
         cfg = self.model.config

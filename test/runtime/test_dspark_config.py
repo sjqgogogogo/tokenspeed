@@ -102,6 +102,41 @@ def test_geometry_reads_nested_dflash_config() -> None:
     assert _resolve_block_geometry(cfg, spec_num_tokens=8) == (8, 7)
 
 
+def test_dflash_records_attention_dp_size_from_draft_mapping() -> None:
+    drafter = DFlash.__new__(DFlash)
+    runner = SimpleNamespace(
+        device="cpu",
+        model=SimpleNamespace(
+            config=SimpleNamespace(
+                dflash_config={"target_layer_ids": [1], "mask_token_id": 3},
+                hidden_size=4,
+            )
+        ),
+        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=4)),
+        server_args=SimpleNamespace(speculative_draft_model_path="draft"),
+    )
+
+    with (
+        mock.patch.object(DFlash, "_init_native_buffers"),
+        mock.patch.object(DFlash, "_init_fused_kv_helper"),
+        mock.patch.object(DFlash, "_init_incremental_proj"),
+    ):
+        DFlash.__init__(
+            drafter,
+            spec_num_tokens=8,
+            spec_num_steps=7,
+            draft_model_runner=runner,
+            runtime_states=object(),
+            input_buffers=object(),
+            cache_view=object(),
+            attn_backend=object(),
+            token_to_kv_pool=object(),
+            vocab_size=16,
+        )
+
+    assert drafter.dp_size == 4
+
+
 def test_geometry_rejects_true_mismatch_with_actionable_message() -> None:
     """A block_size matching neither convention is a launch error, not a warning."""
     cfg = SimpleNamespace(block_size=5)
