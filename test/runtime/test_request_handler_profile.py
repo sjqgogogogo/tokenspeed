@@ -31,6 +31,7 @@ def _make_handler(attn_mapping: SimpleNamespace | None = None) -> RequestHandler
     handler.attn_tp_cpu_group = None
     handler.profile_rank_tag = request_handler_mod._profile_rank_tag(attn_mapping)
     handler._profile_runner = None
+    handler._prepared_torch_profiler = None
     handler.init_profiler()
     return handler
 
@@ -235,6 +236,68 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.assertIs(
             profile.call_args.kwargs["experimental_config"], experimental_config
         )
+
+    def test_graph_profile_consumes_prepared_profiler(self):
+        calls = []
+        profiler = mock.Mock()
+        profiler.start_trace.side_effect = lambda: calls.append("start_trace")
+        profiler.stop_trace.side_effect = lambda: calls.append("stop_trace")
+        profiler.export_chrome_trace.side_effect = lambda _path: calls.append("export")
+        prepared = SimpleNamespace(
+            profiler=profiler,
+            configuration_error=mock.Mock(return_value=None),
+        )
+        self.handler._prepared_torch_profiler = prepared
+        self.handler._profile_runner = lambda fn: (calls.append("barrier"), fn())[1]
+        req = ProfileReq(
+            type=ProfileReqType.START_PROFILE,
+            output_dir=self.output_dir,
+            activities=["CPU", "GPU"],
+            with_stack=False,
+            record_shapes=False,
+            profile_id="prepared-profile",
+        )
+
+        with mock.patch.object(request_handler_mod.torch.profiler, "profile") as profile:
+            result = self.handler.profile(req)
+            self.assertTrue(result.success)
+            result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            calls,
+            ["barrier", "start_trace", "barrier", "stop_trace", "export"],
+        )
+        prepared.configuration_error.assert_called_once_with(
+            ["CPU", "GPU"], False, False
+        )
+        profile.assert_not_called()
+        self.assertIsNone(self.handler._prepared_torch_profiler)
+        self.assertFalse(self.handler.torch_profiler_prepared_lifecycle)
+
+    def test_graph_profile_rejects_incompatible_first_configuration(self):
+        prepared = SimpleNamespace(
+            profiler=mock.Mock(),
+            configuration_error=mock.Mock(
+                return_value="the first graph-mode profile must use with_stack=False"
+            ),
+        )
+        self.handler._prepared_torch_profiler = prepared
+        result = self.handler.profile(
+            ProfileReq(
+                type=ProfileReqType.START_PROFILE,
+                output_dir=self.output_dir,
+                activities=["CPU", "GPU"],
+                with_stack=True,
+                record_shapes=False,
+                profile_id="bad-prepared-profile",
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("with_stack=False", result.message)
+        self.assertIs(self.handler._prepared_torch_profiler, prepared)
+        self.assertFalse(self.handler.profile_in_progress)
 
     def test_gpu_only_profiler_does_not_enable_global_cpu_callbacks(self):
         profiler = mock.Mock()

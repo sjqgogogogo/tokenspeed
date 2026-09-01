@@ -85,7 +85,7 @@ from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.profiler import prime_torch_cuda_profiler
+from tokenspeed.runtime.utils.profiler import prepare_torch_cuda_profiler
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -184,6 +184,7 @@ class ModelExecutorConfig:
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
     model_is_mrope: bool
+    disaggregation_mode: str = "null"
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -296,6 +297,7 @@ class ModelExecutorConfig:
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             model_is_mrope=model_is_mrope,
+            disaggregation_mode=server_args.disaggregation_mode,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -576,12 +578,13 @@ class ModelExecutor:
 
         self._autotune()
 
-        # Distributed workspaces, model loading, and custom-kernel autotuning
-        # must finish before CUPTI is initialized. Prime it at the last safe
-        # point before decode/prefill CUDA graph capture so a later runtime
-        # profiler can attach without invalidating graph replay.
-        torch.cuda.synchronize(self.device)
-        prime_torch_cuda_profiler()
+        self.prepared_torch_profiler = None
+        if self._uses_runtime_cuda_graph():
+            # Prepare, but do not start or stop, the first runtime profiler.
+            # It stays prepared across graph capture and is consumed by the
+            # first /start_profile request.
+            torch.cuda.synchronize(self.device)
+            self.prepared_torch_profiler = prepare_torch_cuda_profiler()
 
         workspace_pool(self.device).freeze()
 
@@ -616,6 +619,15 @@ class ModelExecutor:
         set_random_seed(48)
 
         logger.info("ModelExecutor initialized")
+
+    def _uses_runtime_cuda_graph(self) -> bool:
+        """Whether this engine role will replay a captured model graph."""
+        mode = self.config.disaggregation_mode
+        if mode == "prefill":
+            return not self.prefill_graph.disable
+        if mode == "decode":
+            return not self.forward_step.disable
+        return not self.forward_step.disable or not self.prefill_graph.disable
 
     def _autotune(self) -> None:
         """Profile tunable kernels over one dummy prefill before graph capture.

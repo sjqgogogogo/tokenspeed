@@ -134,11 +134,13 @@ iteration.
 - PyTorch `CPU` / `GPU` profiling writes one `.trace.json.gz` per scheduler
   rank. CUDA activity collection is process-wide, while global
   RecordFunction callbacks include eager operators launched by the scheduler's
-  data-plane thread. After distributed setup, model loading, and kernel
-  autotuning—but before graph capture—TokenSpeed initializes CUPTI with a
-  CUDA-aware empty session. This avoids disturbing custom-kernel initialization,
-  runtime attachment invalidating a captured graph, and the legacy CPU-only
-  warmup suppressing CUDA activities in subsequent profiler sessions.
+  data-plane thread. Eager execution creates the profiler when
+  `/start_profile` arrives. A role that will replay a captured model CUDA graph
+  instead prepares its first profiler after kernel autotuning and before graph
+  capture, then starts that same session on `/start_profile`; no profiler is
+  started or stopped during service initialization. The first graph-mode
+  profile therefore uses `CPU` + `GPU`, `with_stack=false`, and
+  `record_shapes=false`.
 
 ### Plugins
 

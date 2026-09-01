@@ -79,6 +79,7 @@ from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
+    from tokenspeed.runtime.utils.profiler import PreparedTorchProfiler
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ class RequestHandler:
         memory_controller=None,
         model_runner=None,
         profile_runner: Callable[[Callable[[], object]], object] | None = None,
+        prepared_torch_profiler: PreparedTorchProfiler | None = None,
     ) -> None:
 
         self.forward_ct = 0
@@ -129,6 +131,7 @@ class RequestHandler:
         # Runs a FIFO barrier on the data-plane thread at profiler boundaries.
         # This keeps global RecordFunction callbacks from crossing start/stop.
         self._profile_runner = profile_runner
+        self._prepared_torch_profiler = prepared_torch_profiler
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -361,6 +364,7 @@ class RequestHandler:
         self.profiler_decode_ct: int | None = None
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
+        self.torch_profiler_prepared_lifecycle: bool = False
         self.viztracer = None
 
     def init_profile(
@@ -384,6 +388,21 @@ class RequestHandler:
             output_dir = envs.TOKENSPEED_PROFILER_DIR.get()
         if activities is None:
             activities = ["CPU", "GPU"]
+
+        if self._prepared_torch_profiler is not None:
+            configuration_error = self._prepared_torch_profiler.configuration_error(
+                activities,
+                with_stack,
+                record_shapes,
+            )
+            if configuration_error is not None:
+                return ProfileReqOutput(
+                    success=False,
+                    message=(
+                        "A CUDA profiler was prepared before graph capture; "
+                        f"{configuration_error}."
+                    ),
+                )
 
         # All validation must precede any state mutation: the event loop runs
         # _profile_batch_predicate on every batch, so a rejected request that
@@ -466,21 +485,30 @@ class RequestHandler:
         if torchprof_activities:
             if self._profile_runner is not None:
                 self._profile_runner(lambda: None)
-            profiler_kwargs = {}
-            if torch.profiler.ProfilerActivity.CPU in torchprof_activities:
-                # Model forwards run on the custom ForwardThread. Global
-                # RecordFunction callbacks retain its eager CPU ops while the
-                # process-wide CUDA activity collector records its launches.
-                profiler_kwargs["experimental_config"] = (
-                    torch.profiler._ExperimentalConfig(profile_all_threads=True)
+            if self._prepared_torch_profiler is not None:
+                prepared_profiler = self._prepared_torch_profiler
+                prepared_profiler.profiler.start_trace()
+                self._prepared_torch_profiler = None
+                self.torch_profiler = prepared_profiler.profiler
+                self.torch_profiler_prepared_lifecycle = True
+            else:
+                profiler_kwargs = {}
+                if torch.profiler.ProfilerActivity.CPU in torchprof_activities:
+                    # Model forwards run on the custom ForwardThread. Global
+                    # RecordFunction callbacks retain its eager CPU ops while the
+                    # process-wide CUDA activity collector records its launches.
+                    profiler_kwargs["experimental_config"] = (
+                        torch.profiler._ExperimentalConfig(profile_all_threads=True)
+                    )
+                self.torch_profiler = torch.profiler.profile(
+                    activities=torchprof_activities,
+                    with_stack=with_stack if with_stack is not None else True,
+                    record_shapes=(
+                        record_shapes if record_shapes is not None else False
+                    ),
+                    **profiler_kwargs,
                 )
-            self.torch_profiler = torch.profiler.profile(
-                activities=torchprof_activities,
-                with_stack=with_stack if with_stack is not None else True,
-                record_shapes=record_shapes if record_shapes is not None else False,
-                **profiler_kwargs,
-            )
-            self.torch_profiler.start()
+                self.torch_profiler.start()
 
         if "MEM" in activities:
             torch.cuda.memory._record_memory_history(max_entries=100000)
@@ -500,7 +528,7 @@ class RequestHandler:
             except Exception as exc:
                 logger.exception("Failed to start Proton profiling")
                 if self.torch_profiler is not None:
-                    self.torch_profiler.stop()
+                    self._stop_torch_profiler()
                     self.torch_profiler = None
                 if "MEM" in activities:
                     torch.cuda.memory._record_memory_history(enabled=None)
@@ -535,6 +563,13 @@ class RequestHandler:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
+    def _stop_torch_profiler(self) -> None:
+        if self.torch_profiler_prepared_lifecycle:
+            self.torch_profiler.stop_trace()
+            self.torch_profiler_prepared_lifecycle = False
+        else:
+            self.torch_profiler.stop()
+
     def stop_profile(self, stage: ForwardMode | None = None) -> ProfileReqOutput | None:
         if not self.profile_in_progress:
             return ProfileReqOutput(
@@ -550,7 +585,7 @@ class RequestHandler:
         if self.torch_profiler is not None:
             if self._profile_runner is not None:
                 self._profile_runner(lambda: None)
-            self.torch_profiler.stop()
+            self._stop_torch_profiler()
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.profiler_output_dir,

@@ -514,6 +514,7 @@ class EventLoop:
             memory_controller=self._memory,
             model_runner=target,
             profile_runner=self.model_executor.forward_thread.run,
+            prepared_torch_profiler=self.model_executor.prepared_torch_profiler,
         )
 
         self.output_processor = OutputProcesser(
