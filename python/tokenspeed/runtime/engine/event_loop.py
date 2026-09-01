@@ -156,12 +156,12 @@ class EventLoop:
             draft_model_config=draft_model_config,
         )
 
-        # Select this rank's device before initializing CUPTI, and do it before
-        # distributed initialization samples available memory so the profiler's
-        # retained allocations are included in the scheduler's memory budget.
-        torch.get_device_module(server_args.device).set_device(gpu_id)
-        prime_torch_cuda_profiler()
         min_per_gpu_mem = self._init_distributed()
+        # Distributed/NCCL/custom-all-reduce initialization must own the first
+        # CUDA setup on each rank. Once it is complete, initialize CUPTI before
+        # any model CUDA graph is captured so runtime profiling can attach
+        # without invalidating graph replay.
+        prime_torch_cuda_profiler()
 
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
