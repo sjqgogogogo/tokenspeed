@@ -83,31 +83,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def prime_torch_cuda_profiler() -> None:
-    """Initialize CUDA profiling before any serving CUDA graph is captured.
-
-    The legacy ``torch.profiler._utils._init_for_cuda_graphs`` helper opens a
-    CPU-only profiler session. On modern PyTorch/CUDA builds that session can
-    prevent every later Kineto session from collecting CUDA activities. An
-    explicit CUDA-aware session initializes CUPTI without poisoning subsequent
-    runtime profiles.
-    """
-    cuda_activity = torch.profiler.ProfilerActivity.CUDA
-    if (
-        torch.version.cuda is None
-        or cuda_activity not in torch.profiler.supported_activities()
-    ):
-        return
-
-    profiler = torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, cuda_activity],
-        with_stack=False,
-        record_shapes=False,
-    )
-    profiler.start()
-    profiler.stop()
-
-
 def _profile_rank_tag(attn_mapping) -> str:
     """File-name tag identifying this scheduler process's profile outputs."""
     parts = []

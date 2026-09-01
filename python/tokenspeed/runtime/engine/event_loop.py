@@ -50,10 +50,7 @@ from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender, NullSend
 from tokenspeed.runtime.engine.load_snapshot import create_load_reporter
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
-from tokenspeed.runtime.engine.request_handler import (
-    RequestHandler,
-    prime_torch_cuda_profiler,
-)
+from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
     aligned_max_scheduled_tokens,
@@ -157,11 +154,6 @@ class EventLoop:
         )
 
         min_per_gpu_mem = self._init_distributed()
-        # Distributed/NCCL/custom-all-reduce initialization must own the first
-        # CUDA setup on each rank. Once it is complete, initialize CUPTI before
-        # any model CUDA graph is captured so runtime profiling can attach
-        # without invalidating graph replay.
-        prime_torch_cuda_profiler()
 
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank

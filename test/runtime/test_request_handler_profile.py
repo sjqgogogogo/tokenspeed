@@ -195,47 +195,6 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             "DP1-CP0-TP2",
         )
 
-    def test_cuda_profiler_prime_uses_cuda_aware_session(self):
-        profiler = mock.Mock()
-        with (
-            mock.patch.object(request_handler_mod.torch.version, "cuda", "12.9"),
-            mock.patch.object(
-                request_handler_mod.torch.profiler,
-                "supported_activities",
-                return_value={
-                    request_handler_mod.torch.profiler.ProfilerActivity.CPU,
-                    request_handler_mod.torch.profiler.ProfilerActivity.CUDA,
-                },
-            ),
-            mock.patch.object(
-                request_handler_mod.torch.profiler,
-                "profile",
-                return_value=profiler,
-            ) as profile,
-        ):
-            request_handler_mod.prime_torch_cuda_profiler()
-
-        self.assertEqual(
-            profile.call_args.kwargs["activities"],
-            [
-                request_handler_mod.torch.profiler.ProfilerActivity.CPU,
-                request_handler_mod.torch.profiler.ProfilerActivity.CUDA,
-            ],
-        )
-        self.assertFalse(profile.call_args.kwargs["with_stack"])
-        self.assertFalse(profile.call_args.kwargs["record_shapes"])
-        profiler.start.assert_called_once()
-        profiler.stop.assert_called_once()
-
-    def test_cuda_profiler_prime_is_skipped_outside_cuda(self):
-        with (
-            mock.patch.object(request_handler_mod.torch.version, "cuda", None),
-            mock.patch.object(request_handler_mod.torch.profiler, "profile") as profile,
-        ):
-            request_handler_mod.prime_torch_cuda_profiler()
-
-        profile.assert_not_called()
-
     def test_torch_profiler_profiles_all_threads_between_data_plane_barriers(self):
         calls = []
         profiler = mock.Mock()

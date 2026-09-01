@@ -85,6 +85,7 @@ from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.profiler import prime_torch_cuda_profiler
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -574,6 +575,13 @@ class ModelExecutor:
         )
 
         self._autotune()
+
+        # Distributed workspaces, model loading, and custom-kernel autotuning
+        # must finish before CUPTI is initialized. Prime it at the last safe
+        # point before decode/prefill CUDA graph capture so a later runtime
+        # profiler can attach without invalidating graph replay.
+        torch.cuda.synchronize(self.device)
+        prime_torch_cuda_profiler()
 
         workspace_pool(self.device).freeze()
 
