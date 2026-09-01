@@ -50,7 +50,10 @@ from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender, NullSend
 from tokenspeed.runtime.engine.load_snapshot import create_load_reporter
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
-from tokenspeed.runtime.engine.request_handler import RequestHandler
+from tokenspeed.runtime.engine.request_handler import (
+    RequestHandler,
+    prime_torch_cuda_profiler,
+)
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
     aligned_max_scheduled_tokens,
@@ -153,6 +156,11 @@ class EventLoop:
             draft_model_config=draft_model_config,
         )
 
+        # Select this rank's device before initializing CUPTI, and do it before
+        # distributed initialization samples available memory so the profiler's
+        # retained allocations are included in the scheduler's memory budget.
+        torch.get_device_module(server_args.device).set_device(gpu_id)
+        prime_torch_cuda_profiler()
         min_per_gpu_mem = self._init_distributed()
 
         target, draft = create_model_runner(
@@ -1408,12 +1416,6 @@ def run_event_loop(
                 signal.SIGTERM,
                 lambda _signum, _frame: shutdown_event.set(),
             )
-
-        # Do not call torch.profiler._utils._init_for_cuda_graphs here. That
-        # private CUDA < 12 workaround opens an empty profiler session and, on
-        # modern PyTorch/CUDA builds, can leave every later session without
-        # CUDA runtime or kernel activities. Supported CUDA versions attach
-        # CUPTI safely after graph capture.
 
         event_loop = EventLoop(
             server_args,

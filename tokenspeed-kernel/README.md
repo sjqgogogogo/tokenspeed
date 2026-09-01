@@ -134,9 +134,10 @@ iteration.
 - PyTorch `CPU` / `GPU` profiling writes one `.trace.json.gz` per scheduler
   rank. CUDA activity collection is process-wide, while global
   RecordFunction callbacks include eager operators launched by the scheduler's
-  data-plane thread. Modern CUDA attaches the profiler after graph capture;
-  TokenSpeed does not run the legacy empty-session CUPTI warmup used by CUDA
-  versions older than 12.
+  data-plane thread. After each rank selects its device and before graph
+  capture, TokenSpeed initializes CUPTI with a CUDA-aware empty session. This
+  avoids both runtime attachment invalidating a captured graph and the legacy
+  CPU-only warmup suppressing CUDA activities in subsequent profiler sessions.
 
 ### Plugins
 
