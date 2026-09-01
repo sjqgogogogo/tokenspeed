@@ -30,6 +30,7 @@ def _make_handler(attn_mapping: SimpleNamespace | None = None) -> RequestHandler
     handler.attn_tp_rank = attn_mapping.tp_rank
     handler.attn_tp_cpu_group = None
     handler.profile_rank_tag = request_handler_mod._profile_rank_tag(attn_mapping)
+    handler._profile_runner = None
     handler.init_profiler()
     return handler
 
@@ -193,6 +194,72 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             ),
             "DP1-CP0-TP2",
         )
+
+    def test_torch_profiler_profiles_all_threads_between_data_plane_barriers(self):
+        calls = []
+        profiler = mock.Mock()
+        profiler.start.side_effect = lambda: calls.append("start")
+        profiler.stop.side_effect = lambda: calls.append("stop")
+        profiler.export_chrome_trace.side_effect = lambda _path: calls.append("export")
+
+        def run_on_data_plane(fn):
+            calls.append("barrier")
+            return fn()
+
+        self.handler._profile_runner = run_on_data_plane
+        experimental_config = object()
+        req = ProfileReq(
+            type=ProfileReqType.START_PROFILE,
+            output_dir=self.output_dir,
+            activities=["CPU", "GPU"],
+            profile_id="threaded-profile",
+        )
+
+        with (
+            mock.patch.object(
+                request_handler_mod.torch.profiler, "profile", return_value=profiler
+            ) as profile,
+            mock.patch.object(
+                request_handler_mod.torch.profiler,
+                "_ExperimentalConfig",
+                return_value=experimental_config,
+            ) as config,
+        ):
+            result = self.handler.profile(req)
+            self.assertTrue(result.success)
+            result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+
+        self.assertTrue(result.success)
+        self.assertEqual(calls, ["barrier", "start", "barrier", "stop", "export"])
+        config.assert_called_once_with(profile_all_threads=True)
+        self.assertIs(
+            profile.call_args.kwargs["experimental_config"], experimental_config
+        )
+
+    def test_gpu_only_profiler_does_not_enable_global_cpu_callbacks(self):
+        profiler = mock.Mock()
+        req = ProfileReq(
+            type=ProfileReqType.START_PROFILE,
+            output_dir=self.output_dir,
+            activities=["GPU"],
+            profile_id="gpu-only-profile",
+        )
+
+        with (
+            mock.patch.object(
+                request_handler_mod.torch.profiler, "profile", return_value=profiler
+            ) as profile,
+            mock.patch.object(
+                request_handler_mod.torch.profiler, "_ExperimentalConfig"
+            ) as config,
+        ):
+            result = self.handler.profile(req)
+            self.assertTrue(result.success)
+            result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+
+        self.assertTrue(result.success)
+        config.assert_not_called()
+        self.assertNotIn("experimental_config", profile.call_args.kwargs)
 
     def test_proton_outputs_do_not_collide_across_dp_ranks(self):
         # Two DP peers share attn_tp_rank=0 but must write distinct files.

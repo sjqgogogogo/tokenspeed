@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -112,6 +113,7 @@ class RequestHandler:
         pause_controller=None,
         memory_controller=None,
         model_runner=None,
+        profile_runner: Callable[[Callable[[], object]], object] | None = None,
     ) -> None:
 
         self.forward_ct = 0
@@ -124,6 +126,9 @@ class RequestHandler:
         # ModelRunner for in-place RL weight sync (NCCL group init + receive).
         # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
         self.model_runner = model_runner
+        # Runs a FIFO barrier on the data-plane thread at profiler boundaries.
+        # This keeps global RecordFunction callbacks from crossing start/stop.
+        self._profile_runner = profile_runner
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -459,10 +464,21 @@ class RequestHandler:
         ]
 
         if torchprof_activities:
+            if self._profile_runner is not None:
+                self._profile_runner(lambda: None)
+            profiler_kwargs = {}
+            if torch.profiler.ProfilerActivity.CPU in torchprof_activities:
+                # Model forwards run on the custom ForwardThread. Global
+                # RecordFunction callbacks retain its eager CPU ops while the
+                # process-wide CUDA activity collector records its launches.
+                profiler_kwargs["experimental_config"] = (
+                    torch.profiler._ExperimentalConfig(profile_all_threads=True)
+                )
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
+                **profiler_kwargs,
             )
             self.torch_profiler.start()
 
@@ -532,6 +548,8 @@ class RequestHandler:
         logger.info("Stop profiling%s...", stage_suffix)
 
         if self.torch_profiler is not None:
+            if self._profile_runner is not None:
+                self._profile_runner(lambda: None)
             self.torch_profiler.stop()
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
