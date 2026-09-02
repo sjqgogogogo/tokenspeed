@@ -1109,57 +1109,21 @@ class ModelExecutor:
 
         Called by the EventLoop when this DP rank has no work but other
         ranks do. The MoE all-to-all is a collective that requires ALL
-        ranks to participate.
+        ranks to participate. Idle work deliberately stays eager: a captured
+        ``bs=0`` replay reuses persistent graph buffers from the rank's prior
+        active batch and can hang or fault on an active-to-idle transition.
         """
-        graph_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
             bs=0,
             num_extends=0,
             input_num_tokens=0,
-            forward_mode=graph_forward_mode,
+            forward_mode=ForwardMode.IDLE,
             global_num_tokens=dp_metadata.global_num_tokens,
             global_bs=dp_metadata.global_batch_size,
             all_decode_or_idle=dp_metadata.all_decode_or_idle,
         )
-        sampling_info = SamplingBatchInfo(
-            req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
-            valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            is_all_greedy=True,
-            vocab_size=self.runtime_states.vocab_size,
-            device=self.device,
-        )
-        if self.forward_step.can_run(bs=0, ctx=ctx):
-            padded_bs = self.forward_step.padded_bs(bs=0, ctx=ctx)
-            self.input_buffers.fill_dummy_decode_buffers(
-                batch_size=padded_bs,
-                total_tokens=padded_bs * self.config.output_length,
-            )
-            # Captured hostfunc pops one entry per replay; push a dummy
-            # for this idle replay, same as run_once.
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.add_batch(
-                    grammars=[None] * padded_bs, bs=padded_bs, has_candidates=False
-                )
-            # IDLE doesn't produce tokens, so no sampler/drafter call here —
-            # only the model forward, which still participates in collectives.
-            # A rank that previously served a larger batch still has real page
-            # ids in the padded_bs rows the captured drafter steps read; their
-            # draft KV writes would alias live requests' pages (#955).
-            self._draft_staging.publish(None, bs=0, padded_bs=padded_bs)
-            with nvtx_range("forward_step idle", color="blue"):
-                self.forward_step(
-                    bs=0,
-                    ctx=ctx,
-                    sampling_info=sampling_info,
-                    page_table=self.draft_page_table,
-                )
-            return
-
-        # Run model forward with IDLE mode — skips attention but still
-        # participates in MLP NCCL collectives (dense all-gather, MoE).
-        ctx.forward_mode = ForwardMode.IDLE
         empty = torch.zeros(0, dtype=torch.int32, device=self.device)
         self.model_runner.forward(
             ctx,
