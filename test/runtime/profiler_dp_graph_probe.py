@@ -40,8 +40,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -51,6 +53,10 @@ import torch.multiprocessing as mp
 
 CASES = ("baseline", "prepared", "prepared_profile")
 WORLD_SIZE = 2
+
+
+def _stage(rank: int, case: str, stage: str) -> None:
+    print(json.dumps({"case": case, "rank": rank, "stage": stage}), flush=True)
 
 
 def _prepare_profiler():
@@ -92,37 +98,38 @@ def _worker(
     output_dir: str,
 ) -> None:
     torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
     dist.init_process_group(
         backend="nccl",
         init_method=init_method,
         rank=rank,
         world_size=WORLD_SIZE,
+        timeout=timedelta(seconds=90),
+        device_id=device,
     )
-    device = torch.device("cuda", rank)
+    _stage(rank, case, "process_group_ready")
     value = torch.zeros(1, dtype=torch.float32, device=device)
 
-    # Initialize the communicator before either profiling or graph capture.
-    for _ in range(3):
-        value.fill_(rank)
-        dist.all_reduce(value)
+    # PyTorch's NCCL graph tests require one eager collective before capture
+    # so communicator initialization cannot occur from inside capture.
+    value.fill_(rank)
+    dist.all_reduce(value)
     torch.cuda.synchronize(device)
-    dist.barrier()
+    _stage(rank, case, "communicator_warm")
 
     profiler = _prepare_profiler() if case != "baseline" else None
+    _stage(rank, case, "profiler_prepared" if profiler is not None else "no_profiler")
 
-    capture_stream = torch.cuda.Stream(device=device)
-    capture_stream.wait_stream(torch.cuda.current_stream(device))
     graph = torch.cuda.CUDAGraph()
-    dist.barrier()
-    with torch.cuda.graph(graph, stream=capture_stream):
+    with torch.cuda.graph(graph):
         dist.all_reduce(value)
-    torch.cuda.current_stream(device).wait_stream(capture_stream)
     torch.cuda.synchronize(device)
-    dist.barrier()
+    _stage(rank, case, "graph_captured")
 
     profiling = case == "prepared_profile"
     if profiling:
         profiler.start_trace()
+        _stage(rank, case, "profile_started")
 
     for round_idx in range(rounds):
         active_rank = round_idx % WORLD_SIZE
@@ -134,7 +141,7 @@ def _worker(
             raise AssertionError(
                 f"rank {rank} round {round_idx}: all-reduce produced {observed}"
             )
-        dist.barrier()
+    _stage(rank, case, "replays_complete")
 
     summary = {
         "case": case,
@@ -145,6 +152,7 @@ def _worker(
     }
     if profiling:
         profiler.stop_trace()
+        _stage(rank, case, "profile_stopped")
         trace_path = Path(output_dir) / f"{case}-rank{rank}.json"
         profiler.export_chrome_trace(str(trace_path))
         summary.update(_trace_counts(trace_path))
@@ -200,6 +208,9 @@ def main() -> int:
         args.output_dir or tempfile.mkdtemp(prefix="ts-profiler-dp-graph-")
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    # NCCL documents async error handling as incompatible with graph capture.
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "0")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0")
     cases = (args.case,) if args.case is not None else CASES
     failed = False
     for case in cases:
