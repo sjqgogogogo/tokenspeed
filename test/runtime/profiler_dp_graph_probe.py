@@ -161,7 +161,18 @@ def _worker(
     (Path(output_dir) / f"{case}-rank{rank}-summary.json").write_text(
         json.dumps(summary, sort_keys=True)
     )
+    _stage(rank, case, "summary_written")
+
+    # A captured NCCL graph retains communicator registrations. Release the
+    # graph before destroying the process group; doing this in the opposite
+    # order can leave ProcessGroupNCCL teardown waiting indefinitely even
+    # though every replay already completed.
+    del graph
+    del value
+    torch.cuda.synchronize(device)
+    _stage(rank, case, "graph_released")
     dist.destroy_process_group()
+    _stage(rank, case, "process_group_destroyed")
 
 
 def run_case(case: str, rounds: int, output_dir: Path, timeout: float) -> list[dict]:
@@ -179,6 +190,12 @@ def run_case(case: str, rounds: int, output_dir: Path, timeout: float) -> list[d
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() < deadline:
+            # The experiment is complete once every rank has validated all
+            # replays (and, when enabled, stopped/exported its profile).
+            # ProcessGroupNCCL teardown is outside the behavior under test and
+            # can outlive captured-graph resources on some NCCL versions.
+            if all(path.exists() for path in summaries):
+                return [json.loads(path.read_text()) for path in summaries]
             if context.join(timeout=1.0):
                 return [json.loads(path.read_text()) for path in summaries]
         raise TimeoutError(f"{case} exceeded {timeout:.0f}s")
