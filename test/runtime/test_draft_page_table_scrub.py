@@ -100,23 +100,52 @@ class DraftPageTableScrubTest(unittest.TestCase):
         self.assertTrue(torch.equal(st.table[1:], torch.zeros_like(st.table[1:])))
 
 
-class IdleForwardModeTest(unittest.TestCase):
-    """DP idle work stays eager instead of replaying persistent graph state."""
+class IdleReplayScrubTest(unittest.TestCase):
+    """The idle replay path skips the batch publish, so it must scrub on its
+    own.
 
-    def test_idle_forward_calls_model_with_idle_mode(self):
+    A DP rank that served a large batch and then goes idle replays the
+    captured drafter graph at padded_bs while another rank decodes; without
+    the idle-path scrub the stale rows route idle draft KV writes into
+    live pages (codex P2 on #955).
+    """
+
+    def test_idle_replay_sees_zeroed_rows(self):
+        padded_bs = 4
+        rows, columns = 8, 4
         captured = {}
+        staging = _staging(rows=rows, columns=columns)
 
-        def forward(ctx, **kwargs):
-            captured["mode"] = ctx.forward_mode
-            captured["input_ids"] = kwargs["input_ids"]
+        class _Step:
+            def can_run(self, bs, ctx):
+                return True
+
+            def padded_bs(self, bs, ctx):
+                return padded_bs
+
+            def __call__(self, bs, ctx, sampling_info, page_table):
+                captured["rows"] = page_table[:padded_bs].clone()
 
         ex = SimpleNamespace(
             attn_backend=None,
             token_to_kv_pool=None,
-            model_runner=SimpleNamespace(forward=forward),
-            drafter=None,
+            input_buffers=SimpleNamespace(
+                req_pool_indices_buf=torch.zeros(rows, dtype=torch.int64),
+                fill_dummy_decode_buffers=lambda batch_size, total_tokens: None,
+            ),
+            runtime_states=SimpleNamespace(
+                valid_cache_lengths=torch.zeros(rows, dtype=torch.int32),
+                vocab_size=32,
+            ),
             device="cpu",
+            config=SimpleNamespace(output_length=1),
+            capturable_grammar=None,
+            _draft_staging=staging,
+            draft_page_table=staging.table,
+            forward_step=_Step(),
         )
+        # Simulate a prior larger batch leaving real ids behind.
+        staging.table[:6] = 7
         ModelExecutor.execute_idle_forward(
             ex,
             DpForwardMetadata(
@@ -128,8 +157,10 @@ class IdleForwardModeTest(unittest.TestCase):
                 need_idle_forward=True,
             ),
         )
-        self.assertEqual(captured["mode"], ForwardMode.IDLE)
-        self.assertEqual(captured["input_ids"].numel(), 0)
+        self.assertIn("rows", captured)
+        self.assertTrue(
+            torch.equal(captured["rows"], torch.zeros_like(captured["rows"]))
+        )
 
 
 if __name__ == "__main__":

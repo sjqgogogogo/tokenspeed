@@ -23,7 +23,9 @@
 This intentionally has no TokenSpeed runtime/model/distributed dependency. It
 models the post-0da906d0 execution topology: the main/control thread captures a
 CUDA graph and handles runtime profiler control, while a custom worker thread
-launches eager CUDA work or replays that pre-captured graph.
+launches eager CUDA work or replays that pre-captured graph. ``legacy`` runs
+the old completed CPU-only warmup before capture; ``prepared`` calls
+``prepare_trace`` before capture and starts that same session afterward.
 
 Run every case in a fresh process so one Kineto session cannot contaminate the
 next::
@@ -44,13 +46,22 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Callable
 from concurrent.futures import Future
 from pathlib import Path
 
 import torch
 
 
-CASES = ("same", "control", "worker", "global", "child_attach")
+CASES = (
+    "same",
+    "control",
+    "worker",
+    "global",
+    "child_attach",
+    "legacy",
+    "prepared",
+)
 WORKLOADS = ("eager", "graph")
 
 _ENABLE_CHILD_SYMBOL = "_ZN5torch8autograd8profiler27enableProfilerInChildThreadEv"
@@ -102,19 +113,29 @@ def _child_profiler_hook(symbol_name: str):
     return hook
 
 
-def _make_workload(kind: str, iterations: int):
+def _make_workload(
+    kind: str,
+    iterations: int,
+    *,
+    legacy_init: bool = False,
+    before_capture: Callable[[], None] | None = None,
+):
     device = torch.device("cuda", 0)
     lhs = torch.randn((1024, 1024), device=device)
     rhs = torch.randn((1024, 1024), device=device)
     out = torch.empty_like(lhs)
 
-    # Match serving startup: load Kineto/CUPTI before graph capture, then attach
-    # the real runtime profiler only after the graph already exists.
-    from torch.profiler._utils import _init_for_cuda_graphs
+    if legacy_init:
+        # The CUDA < 12 workaround used by TokenSpeed before this probe split
+        # the profiler lifecycle cases. On torch 2.13+cu129 it leaves the next
+        # Kineto session without CUDA runtime/kernel activities.
+        from torch.profiler._utils import _init_for_cuda_graphs
 
-    _init_for_cuda_graphs()
+        _init_for_cuda_graphs()
     torch.mm(lhs, rhs, out=out)
     torch.cuda.synchronize()
+    if before_capture is not None:
+        before_capture()
 
     if kind == "eager":
 
@@ -156,6 +177,22 @@ def _start_profiler(*, all_threads: bool = False):
     return profiler
 
 
+def _prepare_profiler():
+    profiler = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        with_stack=False,
+        record_shapes=False,
+        experimental_config=torch.profiler._ExperimentalConfig(
+            profile_all_threads=True
+        ),
+    )
+    profiler.prepare_trace()
+    return profiler
+
+
 def _trace_counts(path: Path) -> dict[str, int]:
     trace = json.loads(path.read_text())
     events = trace.get("traceEvents", [])
@@ -176,10 +213,20 @@ def _trace_counts(path: Path) -> dict[str, int]:
 
 def run_case(case: str, workload_kind: str, iterations: int, output_dir: Path) -> dict:
     torch.cuda.set_device(0)
-    workload = _make_workload(workload_kind, iterations)
+    prepared_profilers = []
+
+    def prepare_profiler():
+        prepared_profilers.append(_prepare_profiler())
+
+    workload = _make_workload(
+        workload_kind,
+        iterations,
+        legacy_init=case == "legacy",
+        before_capture=prepare_profiler if case == "prepared" else None,
+    )
+    profiler = prepared_profilers[0] if prepared_profilers else None
     worker = Worker(torch.device("cuda", 0))
     trace_path = output_dir / f"{case}-{workload_kind}.json"
-    profiler = None
     try:
         if case == "same":
             profiler = _start_profiler()
@@ -205,6 +252,14 @@ def run_case(case: str, workload_kind: str, iterations: int, output_dir: Path) -
             worker.run(workload)
             worker.run(disable)
             profiler.stop()
+        elif case == "legacy":
+            profiler = _start_profiler()
+            workload()
+            profiler.stop()
+        elif case == "prepared":
+            profiler.start_trace()
+            worker.run(workload)
+            profiler.stop_trace()
         else:
             raise ValueError(case)
         profiler.export_chrome_trace(str(trace_path))
