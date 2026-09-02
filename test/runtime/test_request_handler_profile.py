@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -30,6 +31,7 @@ def _make_handler(attn_mapping: SimpleNamespace | None = None) -> RequestHandler
     handler.attn_tp_rank = attn_mapping.tp_rank
     handler.attn_tp_cpu_group = None
     handler.profile_rank_tag = request_handler_mod._profile_rank_tag(attn_mapping)
+    handler._profile_runner = None
     handler.init_profiler()
     return handler
 
@@ -143,12 +145,15 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.assertFalse(self.handler.profile_in_progress)
 
     def test_start_returns_failure_when_proton_cannot_initialize(self):
-        with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(
-            request_handler_mod,
-            "start_profiling",
-            side_effect=RuntimeError("rocprofiler unavailable"),
+        with (
+            mock.patch.object(
+                request_handler_mod, "proton_available", return_value=True
+            ),
+            mock.patch.object(
+                request_handler_mod,
+                "start_profiling",
+                side_effect=RuntimeError("rocprofiler unavailable"),
+            ),
         ):
             result = self.handler.profile(_start_req(self.output_dir))
 
@@ -158,13 +163,15 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
 
     def test_start_and_stop_drive_proton_session_per_rank(self):
         self.handler = _make_handler(_attn_mapping(tp_rank=3))
-        with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(
-            request_handler_mod, "start_profiling"
-        ) as start_profiling, mock.patch.object(
-            request_handler_mod, "stop_profiling"
-        ) as stop_profiling:
+        with (
+            mock.patch.object(
+                request_handler_mod, "proton_available", return_value=True
+            ),
+            mock.patch.object(
+                request_handler_mod, "start_profiling"
+            ) as start_profiling,
+            mock.patch.object(request_handler_mod, "stop_profiling") as stop_profiling,
+        ):
             result = self.handler.profile(_start_req(self.output_dir))
             self.assertTrue(result.success)
             self.assertTrue(self.handler.profile_in_progress)
@@ -194,17 +201,70 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             "DP1-CP0-TP2",
         )
 
+    def test_cuda_profiler_api_uses_synchronized_external_capture_boundaries(self):
+        calls = []
+        cudart = mock.Mock()
+        cudart.cudaProfilerStart.side_effect = lambda: calls.append("start")
+        cudart.cudaProfilerStop.side_effect = lambda: calls.append("stop")
+
+        def run_on_data_plane(fn):
+            calls.append("data-plane")
+            return fn()
+
+        self.handler._profile_runner = run_on_data_plane
+        req = ProfileReq(
+            type=ProfileReqType.START_PROFILE,
+            output_dir=self.output_dir,
+            activities=["CUDA_PROFILER"],
+            profile_id="nsys-profile",
+        )
+
+        with (
+            mock.patch.object(
+                request_handler_mod.torch.cuda,
+                "synchronize",
+                side_effect=lambda: calls.append("synchronize"),
+            ),
+            mock.patch.object(
+                request_handler_mod.torch.cuda, "cudart", return_value=cudart
+            ),
+            mock.patch.object(request_handler_mod.torch.profiler, "profile") as profile,
+        ):
+            result = self.handler.profile(req)
+            self.assertTrue(result.success)
+            result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            calls,
+            [
+                "data-plane",
+                "synchronize",
+                "start",
+                "data-plane",
+                "synchronize",
+                "stop",
+            ],
+        )
+        profile.assert_not_called()
+
+    def test_scheduler_startup_does_not_initialize_legacy_kineto_workaround(self):
+        event_loop_path = Path(request_handler_mod.__file__).with_name("event_loop.py")
+        self.assertNotIn("_init_for_cuda_graphs", event_loop_path.read_text())
+
     def test_proton_outputs_do_not_collide_across_dp_ranks(self):
         # Two DP peers share attn_tp_rank=0 but must write distinct files.
         outputs = []
         for dp_rank in (0, 1):
             handler = _make_handler(_attn_mapping(tp_rank=0, dp_rank=dp_rank))
-            with mock.patch.object(
-                request_handler_mod, "proton_available", return_value=True
-            ), mock.patch.object(
-                request_handler_mod, "start_profiling"
-            ) as start_profiling, mock.patch.object(
-                request_handler_mod, "stop_profiling"
+            with (
+                mock.patch.object(
+                    request_handler_mod, "proton_available", return_value=True
+                ),
+                mock.patch.object(
+                    request_handler_mod, "start_profiling"
+                ) as start_profiling,
+                mock.patch.object(request_handler_mod, "stop_profiling"),
             ):
                 result = handler.profile(_start_req(self.output_dir))
                 self.assertTrue(result.success)
@@ -220,11 +280,13 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         # until every TP peer has finalized its Proton file.
         self.handler.attn_tp_cpu_group = object()
 
-        with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
-            request_handler_mod, "stop_profiling"
-        ) as stop_profiling:
+        with (
+            mock.patch.object(
+                request_handler_mod, "proton_available", return_value=True
+            ),
+            mock.patch.object(request_handler_mod, "start_profiling"),
+            mock.patch.object(request_handler_mod, "stop_profiling") as stop_profiling,
+        ):
             self.barrier.side_effect = lambda group: self.assertTrue(
                 stop_profiling.called
             )
@@ -237,12 +299,16 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
     def test_stop_profile_reports_proton_finalize_failure(self):
         self.handler.attn_tp_cpu_group = object()
 
-        with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
-            request_handler_mod,
-            "stop_profiling",
-            side_effect=RuntimeError("finalize failed"),
+        with (
+            mock.patch.object(
+                request_handler_mod, "proton_available", return_value=True
+            ),
+            mock.patch.object(request_handler_mod, "start_profiling"),
+            mock.patch.object(
+                request_handler_mod,
+                "stop_profiling",
+                side_effect=RuntimeError("finalize failed"),
+            ),
         ):
             self.handler.profile(_start_req(self.output_dir))
             result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
@@ -253,11 +319,13 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.barrier.assert_called_once_with(self.handler.attn_tp_cpu_group)
 
     def test_num_steps_window_finalizes_proton(self):
-        with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
-            request_handler_mod, "stop_profiling"
-        ) as stop_profiling:
+        with (
+            mock.patch.object(
+                request_handler_mod, "proton_available", return_value=True
+            ),
+            mock.patch.object(request_handler_mod, "start_profiling"),
+            mock.patch.object(request_handler_mod, "stop_profiling") as stop_profiling,
+        ):
             result = self.handler.profile(_start_req(self.output_dir, num_steps=2))
             self.assertTrue(result.success)
             self.assertTrue(self.handler.profile_in_progress)

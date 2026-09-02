@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import time
 
+from tokenspeed_scheduler import PD, Forward
+
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
@@ -35,7 +37,6 @@ from tokenspeed.runtime.pd.mooncake.prefill import (
 from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
-from tokenspeed_scheduler import PD, Forward
 
 logger = get_colorful_logger(__name__)
 

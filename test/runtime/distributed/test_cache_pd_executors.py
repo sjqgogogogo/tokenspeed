@@ -18,7 +18,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from runtime.cache_pd_test_utils import block_manifest as make_block_manifest  # noqa: E402
+from runtime.cache_pd_test_utils import (  # noqa: E402
+    block_manifest as make_block_manifest,
+)
 from runtime.cache_pd_test_utils import group as make_group  # noqa: E402
 from runtime.cache_pd_test_utils import layout as make_layout  # noqa: E402
 from runtime.cache_pd_test_utils import operation as make_operation  # noqa: E402
@@ -965,8 +967,8 @@ def test_receiver_bootstrap_failure_is_not_overwritten(
 def test_prefill_bootstrap_diagnostic_shows_local_and_global_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed.runtime.pd.base.status import TransferPoll
     from tokenspeed.runtime.pd import prefill_executor as prefill_module
+    from tokenspeed.runtime.pd.base.status import TransferPoll
 
     sender = SimpleNamespace(bootstrap_room=9, init_time=100.0)
     executor = object.__new__(prefill_module.DisaggPrefillExecutor)

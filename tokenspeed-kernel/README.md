@@ -131,6 +131,24 @@ iteration.
   (`TOKENSPEED_KERNEL_PROFILE_DATA=trace`,
   `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
   traces with `tokenspeed merge-traces`.
+- For a full NVIDIA GPU timeline, launch the decode server under Nsight Systems
+  and use `CUDA_PROFILER` as the `/start_profile` capture gate. Nsight must wrap
+  the server process so it owns CUPTI before TokenSpeed captures CUDA graphs:
+
+  ```bash
+  nsys profile --trace=cuda,nvtx,osrt \
+    --cuda-trace-scope=process-tree --cuda-graph-trace=node \
+    --capture-range=cudaProfilerApi --capture-range-end=stop \
+    --sample=none --cpuctxsw=none -o /tmp/tokenspeed-decode \
+    tokenspeed serve <server arguments> --enable-nvtx
+
+  tokenspeed bench serve <benchmark arguments> \
+    --profile --profile-activities CUDA_PROFILER
+  ```
+
+  `CUDA_PROFILER` delegates collection to the attached external profiler; it
+  must not be combined with PyTorch `GPU` profiling or Proton in the same
+  process.
 
 ### Plugins
 

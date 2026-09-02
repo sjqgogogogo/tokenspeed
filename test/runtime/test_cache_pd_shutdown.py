@@ -155,8 +155,8 @@ def test_dp_idle_forward_still_polls_pd_events(
         loop.trace.append("dp_sync"),
         SimpleNamespace(need_idle_forward=True),
     )[1]
-    loop.model_executor.execute_idle_forward = (
-        lambda _metadata: loop.trace.append("idle_forward")
+    loop.model_executor.execute_idle_forward = lambda _metadata: loop.trace.append(
+        "idle_forward"
     )
     loop.model_executor.forward_thread = SimpleNamespace(
         run=lambda fn: (loop.trace.append("forward_thread_run"), fn())[1]
@@ -212,15 +212,13 @@ def test_dp_idle_forward_still_dispatches_remote_prefill_control_op(
         loop.trace.append("dp_sync"),
         SimpleNamespace(need_idle_forward=True),
     )[1]
-    loop.model_executor.execute_idle_forward = (
-        lambda _metadata: loop.trace.append("idle_forward")
+    loop.model_executor.execute_idle_forward = lambda _metadata: loop.trace.append(
+        "idle_forward"
     )
     loop.model_executor.forward_thread = SimpleNamespace(
         run=lambda fn: (loop.trace.append("forward_thread_run"), fn())[1]
     )
-    loop._mark_stats_scheduled = lambda op: loop.trace.append(
-        ("mark_scheduled", op)
-    )
+    loop._mark_stats_scheduled = lambda op: loop.trace.append(("mark_scheduled", op))
     loop._batch_logger = SimpleNamespace(
         log_dispatch=lambda op, _stats: loop.trace.append(("log_batch", op))
     )

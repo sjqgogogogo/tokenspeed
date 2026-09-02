@@ -513,6 +513,7 @@ class EventLoop:
             pause_controller=self._pause,
             memory_controller=self._memory,
             model_runner=target,
+            profile_runner=self.model_executor.forward_thread.run,
         )
 
         self.output_processor = OutputProcesser(
@@ -1225,9 +1226,7 @@ class EventLoop:
                             )
                         )
                         if forward_op is not None and (
-                            self._forward_dispatcher.produces_model_output(
-                                forward_op
-                            )
+                            self._forward_dispatcher.produces_model_output(forward_op)
                         ):
                             # Defensive zero-token model op: the idle forward
                             # already supplied this rank's collective work.
@@ -1408,17 +1407,10 @@ def run_event_loop(
                 lambda _signum, _frame: shutdown_event.set(),
             )
 
-        if torch.cuda.is_available():
-            # Warm up CUPTI before EventLoop init captures any CUDA graph
-            # (decode/prefill/encoder). A profiler that first attaches AFTER
-            # capture invalidates the captured graphs — every later replay
-            # dies with cudaErrorLaunchFailure — which would forbid runtime
-            # /start_profile on graph-mode servers. One empty profiler
-            # session loads CUPTI ahead of every capture, making runtime
-            # attach/detach safe.
-            from torch.profiler._utils import _init_for_cuda_graphs
-
-            _init_for_cuda_graphs()
+        # Do not initialize Kineto here. External profilers such as Nsight
+        # Systems must own CUPTI from process startup, before EventLoop captures
+        # its CUDA graphs. /start_profile with CUDA_PROFILER only gates that
+        # already-attached external collector through cudaProfilerStart/Stop.
 
         event_loop = EventLoop(
             server_args,

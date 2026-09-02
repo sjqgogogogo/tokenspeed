@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -112,6 +113,7 @@ class RequestHandler:
         pause_controller=None,
         memory_controller=None,
         model_runner=None,
+        profile_runner: Callable[[Callable[[], object]], object] | None = None,
     ) -> None:
 
         self.forward_ct = 0
@@ -124,6 +126,8 @@ class RequestHandler:
         # ModelRunner for in-place RL weight sync (NCCL group init + receive).
         # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
         self.model_runner = model_runner
+        # Runs profiler boundary synchronization on the CUDA data-plane thread.
+        self._profile_runner = profile_runner
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -470,6 +474,7 @@ class RequestHandler:
             torch.cuda.memory._record_memory_history(max_entries=100000)
 
         if "CUDA_PROFILER" in activities:
+            self._synchronize_profile_boundary()
             torch.cuda.cudart().cudaProfilerStart()
 
         if "PROTON" in activities:
@@ -550,6 +555,7 @@ class RequestHandler:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
+            self._synchronize_profile_boundary()
             torch.cuda.cudart().cudaProfilerStop()
 
         proton_error: Exception | None = None
@@ -585,6 +591,14 @@ class RequestHandler:
                 message=f"Failed to finalize Proton profiling: {proton_error}",
             )
         return ProfileReqOutput(success=True, message="Succeeded.")
+
+    def _synchronize_profile_boundary(self) -> None:
+        """Drain submitted work and the device before external profiler toggles."""
+
+        if self._profile_runner is not None:
+            self._profile_runner(torch.cuda.synchronize)
+        else:
+            torch.cuda.synchronize()
 
     def _profile_batch_predicate(self, forward_mode=None):
         """Check and toggle profiling based on forward step count.
