@@ -136,8 +136,7 @@ iteration.
   the server process so it owns CUPTI before TokenSpeed captures CUDA graphs:
 
   ```bash
-  nsys profile --trace=cuda,nvtx,osrt \
-    --cuda-trace-scope=process-tree --cuda-graph-trace=node \
+  nsys profile --trace=cuda,nvtx --cuda-graph-trace=node \
     --capture-range=cudaProfilerApi --capture-range-end=stop \
     --sample=none --cpuctxsw=none -o /tmp/tokenspeed-decode \
     tokenspeed serve <server arguments> --enable-nvtx
@@ -148,7 +147,9 @@ iteration.
 
   `CUDA_PROFILER` delegates collection to the attached external profiler; it
   must not be combined with PyTorch `GPU` profiling or Proton in the same
-  process.
+  process. Before profiling a distributed server, run the three isolated cases
+  in `test/runtime/nsys_cuda_graph_probe.py` to validate control-thread replay,
+  worker-thread replay, and a two-GPU captured NCCL collective separately.
 
 ### Plugins
 
