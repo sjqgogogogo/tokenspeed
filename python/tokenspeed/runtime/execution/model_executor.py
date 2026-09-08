@@ -357,7 +357,20 @@ class ModelExecutor:
             max_bs,
             self.device,
         )
-        if self.config.spec_algo is not None:
+        self.context_producer = None
+        if (
+            draft_model_runner is not None
+            and getattr(draft_model_runner.model, "is_context_only", False) is True
+        ):
+            from tokenspeed.runtime.execution.context_producer import (
+                PrefillTargetContextProducer,
+            )
+
+            self.context_producer = PrefillTargetContextProducer(
+                draft_model_runner.model, draft_token_to_kv_pool
+            )
+            self.drafter = None
+        elif self.config.spec_algo is not None:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
             # already happened in create_model_runner, right after both
             # models loaded. Here only the drafter instance is built and
@@ -452,8 +465,12 @@ class ModelExecutor:
             input_buffers=self.input_buffers,
             config=config,
             drafter=self.drafter,
-            draft_attn_backend=draft_attn_backend,
-            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            # Context-only prefill writers consume target cache locations;
+            # only an executing drafter needs forward metadata of its own.
+            draft_attn_backend=draft_attn_backend if self.drafter is not None else None,
+            draft_token_to_kv_pool=(
+                draft_token_to_kv_pool if self.drafter is not None else None
+            ),
             capturable_grammar=self.capturable_grammar,
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
@@ -461,7 +478,10 @@ class ModelExecutor:
             decode_graph_supported=graph_support.decode_graph,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
-        if config.enforce_eager:
+        # PP forbids attention DP and executes prefill only. Its stage peers
+        # initialize lazy collectives together on their first real prefill;
+        # a DECODE dummy would require state-verify scratch P never allocates.
+        if config.enforce_eager and config.pp_size == 1:
             logger.info("Prewarming Triton RSAG communication states")
             self.forward_step.prewarm_comm_states(batch_sizes=(1,))
             logger.info("Finished prewarming Triton RSAG communication states")
@@ -881,8 +901,13 @@ class ModelExecutor:
 
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
+        ctx.target_context_producer = self.context_producer
 
         logits_output = self._run_target_forward(ctx)
+        if self.context_producer is not None and self._pp_is_last_stage:
+            # The context writer has enqueued all draft cache writes on this
+            # stream. Only its owning stage publishes the continuation barrier.
+            self._record_draft_final_cache_step(ctx.num_extends)
 
         if self.config.pp_size > 1 and not self._pp_is_last_stage:
             # Mid-pipeline stage: the model returned the boundary bundle, not
@@ -1528,8 +1553,11 @@ class ModelExecutor:
 
     def register_draft_final_step_counter(self, step_counter) -> None:
         """Publish one CachePD step after a supported drafter's complete run."""
-        if self.drafter is None or not getattr(
-            self.drafter, "supports_pd_layerwise_finalization", False
+        producer = (
+            self.context_producer if self.context_producer is not None else self.drafter
+        )
+        if producer is None or not getattr(
+            producer, "supports_pd_layerwise_finalization", False
         ):
             raise RuntimeError(
                 "the speculative drafter cannot finalize layerwise CachePD writes"

@@ -49,15 +49,22 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.segmented_rmsnorm import segmented_rmsnorm
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.context_projection import (
+    context_tap_owner_layer,
+    project_context_tap,
+)
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     _prepare_mla_kv_b_proj_weights,
@@ -375,7 +382,22 @@ class K3DSparkModel(nn.Module):
                 float(self.fc_norm[0].variance_epsilon),
             )
             target_hidden = target_hidden.flatten(-2)
-        return self.context_norm(self.context_proj(target_hidden)[0])
+        return self.finalize_target_projection(self.context_proj(target_hidden)[0])
+
+    def project_target_tap(
+        self, capture_idx: int, hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Project one target tap without applying the cross-tap output norm."""
+        width = int(self.config.target_hidden_size)
+        weight = self.context_proj.weight[
+            :, capture_idx * width : (capture_idx + 1) * width
+        ]
+        norm = self.fc_norm[capture_idx] if self.fc_norm is not None else None
+        return project_context_tap(hidden, weight, norm)
+
+    def finalize_target_projection(self, projected: torch.Tensor) -> torch.Tensor:
+        """Apply context RMSNorm once after all target taps have contributed."""
+        return self.context_norm(projected.to(self.context_norm.weight.dtype))
 
     def _finalize_hidden(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
@@ -566,4 +588,187 @@ class K3DSparkModel(nn.Module):
             ).contiguous()
 
 
-EntryClass = [K3DSparkModel]
+class K3DSparkContextAttention(nn.Module):
+    """The KV-only parameters of one DSpark layer, with no query or MLP."""
+
+    project_latent_kv = K3DSparkAttention.project_latent_kv
+    apply_latent_rope = K3DSparkAttention.apply_latent_rope
+
+    def __init__(self, config, mapping: Mapping, layer_id: int, rotary_emb) -> None:
+        super().__init__()
+        self.kv_lora_rank = int(config.kv_lora_rank)
+        self.qk_rope_head_dim = int(config.qk_rope_head_dim)
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            int(config.hidden_size),
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=None,
+            prefix=f"layers.{layer_id}.self_attn.kv_a_proj_with_mqa",
+        )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=float(config.rms_norm_eps))
+        self.rotary_emb = rotary_emb
+        self.attn_mqa = PagedAttention(
+            num_heads=int(config.num_attention_heads) // mapping.attn.tp_size,
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+            scaling=1.0,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            logit_cap=0.0,
+            v_head_dim=self.kv_lora_rank,
+            sliding_window_size=-1,
+            group_id=FULL_ATTENTION,
+        )
+
+
+class K3DSparkContextModel(nn.Module):
+    """Pipeline-local target projection and last-stage MLA context writer.
+
+    This is the parameter subset that prefill needs from a DSpark checkpoint.
+    It never executes a draft block: Decode's existing candidate-free
+    bootstrap performs a single-token verification before normal drafting.
+    """
+
+    is_context_only = True
+    write_context_kv = K3DSparkModel.write_context_kv
+    finalize_target_projection = K3DSparkModel.finalize_target_projection
+
+    def __init__(self, config, mapping: Mapping, quant_config) -> None:
+        super().__init__()
+        validate_k3_dspark_config(config)
+        if quant_config is not None:
+            raise ValueError(
+                "Pipeline DSpark context production requires an unquantized draft checkpoint"
+            )
+        self.config = config
+        self.mapping = mapping
+        self.hidden_size = int(config.hidden_size)
+        self.attention_kind = "kimi_mla"
+        self.checkpoint_load_group = mapping.attn.tp_group
+        self.num_context_features = len(config.target_layer_ids)
+        start, end = pp_layer_window(int(config.target_num_hidden_layers), mapping)
+        self.capture_indices = tuple(
+            idx
+            for idx, layer_id in enumerate(config.target_layer_ids)
+            if start
+            <= context_tap_owner_layer(
+                int(layer_id),
+                int(config.target_num_hidden_layers),
+                config.aux_hidden_stream,
+            )
+            < end
+        )
+        self.tap_weights = nn.ParameterDict(
+            {
+                str(idx): nn.Parameter(
+                    torch.empty(self.hidden_size, int(config.target_hidden_size))
+                )
+                for idx in self.capture_indices
+            }
+        )
+        self.tap_norms = (
+            nn.ModuleDict(
+                {
+                    str(idx): RMSNorm(
+                        int(config.target_hidden_size), eps=float(config.rms_norm_eps)
+                    )
+                    for idx in self.capture_indices
+                }
+            )
+            if config.fc_norm
+            else nn.ModuleDict()
+        )
+        self.context_norm = None
+        self.layers = nn.ModuleList()
+        if mapping.is_last_pp_rank:
+            self.context_norm = RMSNorm(
+                self.hidden_size, eps=float(config.rms_norm_eps)
+            )
+            rotary_emb = get_rope(
+                int(config.qk_rope_head_dim),
+                rotary_dim=int(config.qk_rope_head_dim),
+                max_position=int(config.max_position_embeddings),
+                base=config.resolved_rope_theta(),
+                rope_scaling=config.rope_scaling_dict(),
+                is_neox_style=False,
+            )
+            for layer_id in range(int(config.num_hidden_layers)):
+                layer = nn.Module()
+                layer.self_attn = K3DSparkContextAttention(
+                    config, mapping, layer_id, rotary_emb
+                )
+                self.layers.append(layer)
+
+    def project_target_tap(
+        self, capture_idx: int, hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Project an owned tap, applying its independent norm before the GEMM."""
+        key = str(capture_idx)
+        norm = self.tap_norms[key] if key in self.tap_norms else None
+        return project_context_tap(hidden, self.tap_weights[key], norm)
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        """Load only shards containing this stage's context parameters."""
+        name = name.removeprefix("model.")
+        if name == "context_proj.weight":
+            return bool(self.capture_indices)
+        if name.startswith("fc_norm."):
+            return name.split(".")[1] in self.tap_norms
+        if not self.mapping.is_last_pp_rank:
+            return False
+        return name == "context_norm.weight" or (
+            name.startswith("layers.")
+            and name.endswith(
+                (
+                    ".self_attn.kv_a_proj_with_mqa.weight",
+                    ".self_attn.kv_a_layernorm.weight",
+                )
+            )
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        """Load local projection slices and, on the owner, all context KV weights."""
+        params = dict(self.named_parameters())
+        if not params:
+            # A stage between two tap owners has nothing to load. Do not
+            # consume the lazy iterator: an empty shard filter otherwise
+            # deliberately falls back to reading the entire checkpoint.
+            return
+        loaded = set()
+        width = int(self.config.target_hidden_size)
+        for name, value in weights:
+            name = name.removeprefix("model.")
+            if not self.checkpoint_weight_name_filter(name):
+                continue
+            if name == "context_proj.weight":
+                expected = (self.hidden_size, self.num_context_features * width)
+                if tuple(value.shape) != expected:
+                    raise ValueError(
+                        f"context_proj weight shape {tuple(value.shape)} != {expected}"
+                    )
+                for idx in self.capture_indices:
+                    key = f"tap_weights.{idx}"
+                    default_weight_loader(
+                        params[key], value[:, idx * width : (idx + 1) * width]
+                    )
+                    loaded.add(key)
+                continue
+            if name.startswith("fc_norm."):
+                name = name.replace("fc_norm.", "tap_norms.", 1)
+            if name not in params:
+                raise ValueError(f"Unexpected DSpark context weight {name!r}")
+            weight_loader = getattr(
+                params[name], "weight_loader", default_weight_loader
+            )
+            weight_loader(params[name], value)
+            loaded.add(name)
+        missing = sorted(set(params) - loaded)
+        if missing:
+            raise ValueError(f"DSpark context checkpoint is missing weights: {missing}")
+
+    def forward(
+        self, ctx: ForwardContext, input_ids: torch.Tensor, positions: torch.Tensor
+    ):
+        raise RuntimeError("DSpark context producers do not execute draft forwards")
+
+
+EntryClass = [K3DSparkModel, K3DSparkContextModel]

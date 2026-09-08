@@ -450,6 +450,46 @@ the escalating admission headroom each retraction adds to the victim's next
 admission. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
+### Pipeline ownership: logical geometry and resident fields
+
+`recipes/ownership.py` owns pipeline layer windows. Target layers split using
+`target_stage_windows`; adding a drafter never changes those cuts.
+`CacheLayerOwnership` assigns each stage its target window and assigns all
+trailing draft cache layers to the last stage. The same owner determines
+physical allocation, cache producer barriers and PD transfer fields. The
+registry publishes that owner on the arena for the device-side transfer
+factory; it must not be reconstructed from the draft model's network depth,
+because a draft model may have layers without an independent cache.
+
+Every stage keeps the complete logical plan: group specs, prefix granularity,
+packing, parent count and logical bytes per parent remain identical, so the
+C++ schedulers use the same block IDs. `CacheMemoryPlan.narrow_to_layers`
+retains only the owner's fields and their resident planes, with new local
+arena offsets. Shared planes are retained whole if any owned field uses them.
+A target pool remains a view over target layer IDs and a draft pool a view
+over continuation IDs; narrowing physical storage must not merge those two
+compute views. Only the final stage constructs the draft cache view/backend.
+
+The PD bootstrap publishes the target layer count explicitly alongside the
+complete logical plan. Receivers must not infer target cuts from the highest
+field ID, which includes draft layers. Both the sender and receiver select
+`owner.resident_window`, using stage-major source ranks; physical byte offsets
+are resolved against each stage's resident plan. The last stage is the sole
+source for draft fields, and every target field has exactly one source stage.
+
+Producer steps follow `owner.producer_layers`: one barrier per local target
+layer, then one final barrier for all owned draft fields. A context-only
+prefill writer publishes that final barrier after writing every draft layer's
+context KV on **each** prefill chunk, including chunks that produce no output
+token. Non-final stages publish no draft barrier. A draft with no independent
+cache fields adds no barrier. Request lifetime, transfer pins and completion
+continue to use the existing scheduler and PD protocol; the PP projection
+accumulator is per-forward state and is not a second request cache.
+
+`test/runtime/test_pp_cache_ownership.py` covers target/draft cuts, K3's shared
+MLA/KDA planes, resident-address bounds, producer readiness, stage-major
+TP8 transfer fragments and non-PP behavior using device-independent plans.
+
 ## Code placement
 
 * Prefix-matching code (prefix hashing, match/lookup, reuse boundaries) lives

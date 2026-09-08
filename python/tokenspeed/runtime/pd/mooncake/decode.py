@@ -46,6 +46,7 @@ logger = get_colorful_logger(__name__)
 class PrefillParallelInfo:
     tp_size: int
     dp_size: int
+    num_target_layers: int
     cache_layout: CacheTransferContract | None = None
     # Prefill chunk-pipeline stage count; each stage sends only its own
     # layers' KV, so Decode plans per stage and unions the routes.

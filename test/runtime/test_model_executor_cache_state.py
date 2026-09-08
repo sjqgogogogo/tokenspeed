@@ -128,6 +128,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     )
     executor.grammar_runtime = None
     executor.drafter = _Drafter()
+    executor.context_producer = None
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
@@ -159,6 +160,43 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         "future-input",
         "draft-final",
     ]
+
+
+def test_context_only_prefill_records_final_cache_barrier_for_each_chunk():
+    events = []
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.input_buffers = SimpleNamespace()
+    executor.grammar_runtime = None
+    executor.drafter = None
+    executor.context_producer = SimpleNamespace(supports_pd_layerwise_finalization=True)
+    executor.config = SimpleNamespace(
+        spec_algo="DSPARK", pp_size=4, pp_rank=3, output_length=4
+    )
+    executor.runtime_states = SimpleNamespace(vocab_size=32)
+    executor.nan_guard = SimpleNamespace(
+        audit_logits=lambda *_args: None, merge_oov=lambda *_args: None
+    )
+
+    def target_forward(ctx):
+        assert ctx.target_context_producer is executor.context_producer
+        events.extend(("context-write", "target-return"))
+        return SimpleNamespace(next_token_logprobs=None)
+
+    def sample(*args):
+        events.append("sample")
+        return torch.tensor([3], dtype=torch.int32), torch.tensor(
+            [1], dtype=torch.int32
+        )
+
+    executor._run_target_forward = target_forward
+    executor._run_sampling = sample
+    executor._draft_final_step_counter = SimpleNamespace(
+        record_cache=lambda: events.append("draft-final")
+    )
+    ctx = SimpleNamespace(bs=1, num_extends=1, input_num_tokens=3)
+    for _ in range(2):
+        executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
+    assert events == ["context-write", "target-return", "draft-final", "sample"] * 2
 
 
 def test_cudagraph_gc_flag_reaches_the_capture_context():

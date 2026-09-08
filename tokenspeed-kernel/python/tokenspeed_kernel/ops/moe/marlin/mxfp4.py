@@ -35,6 +35,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import situ_and_mul
+from tokenspeed_kernel.ops.moe.marlin.deepep_layout import (
+    activate_recv_rows,
+    pack_recv_rows,
+    unpack_recv_rows,
+)
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -71,7 +76,7 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     E2M1 as uint8 ``[E, N, K//2]`` and ``w13_weight_scale``/``w2_weight_scale``
     raw E8M0 as uint8 ``[E, N, K//32]``. Output: Marlin-repacked int32 weights
     and permuted float8_e8m0fnu scales, written back onto the module. K3's
-    shapes are already aligned (hidden 7168%256, ispp 3072%128), so no padding.
+    expert shapes are already aligned (latent 3584%256, ispp 3072%128), so no padding.
     """
     names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
     if any(not hasattr(w, name) for name in names):
@@ -299,3 +304,93 @@ def marlin_mxfp4_precomputed_moe_apply(
     ).view(num_tokens, top_k, hidden)
 
     return intermediate3.sum(dim=1)
+
+
+def marlin_mxfp4_masked_moe_apply(
+    plan: dict,
+    recv_x: torch.Tensor,
+    w: torch.nn.Module,
+    masked_m: torch.Tensor,
+    num_global_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Compute DeepEP's valid expert rows with compact Marlin intermediates.
+
+    Args:
+        plan: MoE plan selecting SiTU or SiLU activation.
+        recv_x: BF16 [local_experts, receive_capacity, hidden] dispatch output;
+            reused in place for combine after its valid inputs are packed.
+        w: Local Marlin-repacked MXFP4 weights and activation parameters.
+        masked_m: Device int32 valid row count for every local expert.
+        num_global_tokens: Safe upper bound on all source token rows in this
+            forward (the graph bucket bound when recording a CUDA graph).
+        top_k: Maximum number of distinct selected experts per source token.
+
+    Returns:
+        recv_x with only its valid expert rows replaced by computed outputs.
+        Route weights are applied exactly once by DeepEP combine.
+    """
+    if recv_x.dtype != torch.bfloat16:
+        raise TypeError("Marlin DeepEP receive activations must be BF16")
+    block_m = 16
+    packed, sorted_ids, expert_ids, total, offsets = pack_recv_rows(
+        recv_x, masked_m, num_global_tokens, top_k, block_m
+    )
+    hidden = recv_x.shape[2]
+    ispp = int(w._marlin_ispp)
+    rows = packed.shape[0]
+    workspace = marlin_make_workspace(recv_x.device, max_blocks_per_sm=4)
+    # All scheduled expert IDs are local and valid, so Marlin needs no EP
+    # invalid-block scan. Communication already established expert ownership.
+    # Neither GEMM multiplies route weights: LL combine owns that operation.
+    # The kernel does not read this pointer when mul_topk_weights is false.
+    weights = torch.empty((0,), dtype=torch.float32, device=recv_x.device)
+    gemm1 = moe_wna16_marlin_gemm(
+        packed,
+        torch.empty((rows, 2 * ispp), dtype=recv_x.dtype, device=recv_x.device),
+        w.w13_weight,
+        w.w13_weight_scale,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        total,
+        weights,
+        moe_block_size=block_m,
+        top_k=1,
+        mul_topk_weights=False,
+        is_ep=False,
+        size_m=rows,
+        size_n=2 * ispp,
+        size_k=hidden,
+        use_fp32_reduce=True,
+    )
+    activation = plan.get("activation") or w.activation
+    gemm2_input = activate_recv_rows(
+        gemm1,
+        masked_m,
+        offsets,
+        block_m,
+        activation,
+        float(w.activation_situ_beta) if activation == "situ" else 1.0,
+        w.activation_situ_linear_beta if activation == "situ" else None,
+    )
+    output = moe_wna16_marlin_gemm(
+        gemm2_input,
+        torch.empty((rows, hidden), dtype=recv_x.dtype, device=recv_x.device),
+        w.w2_weight,
+        w.w2_weight_scale,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        total,
+        weights,
+        moe_block_size=block_m,
+        top_k=1,
+        mul_topk_weights=False,
+        is_ep=False,
+        size_m=rows,
+        size_n=hidden,
+        size_k=ispp,
+        use_fp32_reduce=True,
+    )
+    return unpack_recv_rows(output, masked_m, offsets, recv_x, block_m)

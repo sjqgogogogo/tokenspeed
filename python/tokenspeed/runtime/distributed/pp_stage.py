@@ -35,6 +35,9 @@ from dataclasses import dataclass, fields
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+    target_stage_windows,
+)
 
 
 def pp_stage_windows(
@@ -60,35 +63,7 @@ def pp_stage_windows(
     Raises:
         ValueError: the partition length or sum does not match.
     """
-    if partition is not None:
-        if len(partition) != pp_size:
-            raise ValueError(
-                f"pp layer partition {partition} has {len(partition)} entries "
-                f"for {pp_size} pipeline stages"
-            )
-        if any(count <= 0 for count in partition):
-            raise ValueError(
-                f"pp layer partition {partition} must give every stage at "
-                "least one layer"
-            )
-        if sum(partition) != num_layers:
-            raise ValueError(
-                f"pp layer partition {partition} sums to {sum(partition)} "
-                f"but the model has {num_layers} layers"
-            )
-        counts = partition
-    else:
-        base = num_layers // pp_size
-        remainder = num_layers % pp_size
-        counts = tuple(
-            base + (1 if stage < remainder else 0) for stage in range(pp_size)
-        )
-    windows = []
-    start = 0
-    for length in counts:
-        windows.append((start, start + length))
-        start += length
-    return windows
+    return list(target_stage_windows(num_layers, pp_size, partition))
 
 
 def pp_layer_window(num_hidden_layers: int, mapping: Mapping) -> tuple[int, int]:
@@ -123,6 +98,9 @@ class PPStageState:
     # own (full-size) buffer with these rows; its block-write layers fill the
     # rest.
     block_residual: torch.Tensor | None = None
+    # Sum of projected target taps, [num_tokens, draft_hidden], in float32.
+    # The final stage normalizes it once and materializes draft context KV.
+    projected_context: torch.Tensor | None = None
 
     def tensors(self) -> list[torch.Tensor]:
         out = []

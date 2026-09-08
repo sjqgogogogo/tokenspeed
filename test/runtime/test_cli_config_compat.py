@@ -26,6 +26,87 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 class TestCLIConfigCompat(unittest.TestCase):
     """Test that vLLM-style CLI arguments map to TokenSpeed config."""
 
+    def test_k3_prefill_pp4_tp8_ep8_configuration(self):
+        sa = self._from_cli_args_no_init(
+            self._parse_args(
+                [
+                    "--model",
+                    "test/k3",
+                    "--world-size",
+                    "32",
+                    "--pipeline-parallel-size",
+                    "4",
+                    "--attn-tp-size",
+                    "8",
+                    "--expert-parallel-size",
+                    "8",
+                    "--moe-tp-size",
+                    "1",
+                    "--disaggregation-mode",
+                    "prefill",
+                    "--speculative-algorithm",
+                    "DSPARK",
+                ]
+            )
+        )
+        sa.resolve_parallelism()
+        sa.resolve_disaggregation()
+        self.assertEqual(sa.mapping.stage_world_size, 8)
+        self.assertEqual(sa.mapping.attn.tp_size, 8)
+        self.assertEqual(sa.mapping.moe.ep_size, 8)
+        self.assertEqual(sa.mapping.moe.tp_size, 1)
+        self.assertTrue(sa.enforce_eager)
+
+    def test_k3_decode_dp4_tp8_ep32_configuration(self):
+        snapshot = self._parallelism_snapshot(
+            [
+                "--model",
+                "test/k3",
+                "--world-size",
+                "32",
+                "--attn-tp-size",
+                "8",
+                "--data-parallel-size",
+                "4",
+                "--expert-parallel-size",
+                "32",
+                "--moe-tp-size",
+                "1",
+                "--disaggregation-mode",
+                "decode",
+            ]
+        )
+        self.assertEqual(snapshot, (32, 8, 1, 4, 8, 4, 1, 32, 1))
+
+    def test_pp_still_rejects_drafters_without_context_production(self):
+        sa = self._from_cli_args_no_init(
+            self._parse_args(
+                [
+                    "--model",
+                    "test/k3",
+                    "--pipeline-parallel-size",
+                    "4",
+                    "--attn-tp-size",
+                    "8",
+                    "--disaggregation-mode",
+                    "prefill",
+                    "--speculative-algorithm",
+                    "EAGLE3",
+                ]
+            )
+        )
+        sa.resolve_parallelism()
+        with self.assertRaisesRegex(ValueError, "supports only DSPARK"):
+            sa.resolve_disaggregation()
+
+    def test_deepep_capacity_cli_distinguishes_auto_and_explicit(self):
+        automatic = self._parse_args(["--model", "test/k3"])
+        explicit = self._parse_args(
+            ["--model", "test/k3", "--low-latency-max-num-tokens-per-gpu", "64"]
+        )
+        self.assertIsNone(automatic.low_latency_max_num_tokens_per_gpu)
+        self.assertEqual(explicit.low_latency_max_num_tokens_per_gpu, 64)
+
     def _parse_args(self, argv: list[str]) -> argparse.Namespace:
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)

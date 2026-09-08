@@ -146,6 +146,7 @@ different process groups.
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. |
+| `--low-latency-max-num-tokens-per-gpu` | DeepEP send capacity per rank. K3 token dispatch sizes from the maximum per-DP verify batch after TP slicing; pinned low latency also covers prefill/recovery chunks. Other models use 256. Explicit insufficient K3 capacity fails at startup. |
 | `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but

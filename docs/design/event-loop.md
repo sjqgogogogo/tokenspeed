@@ -186,6 +186,15 @@ control plane frees on that commit — a request's shared multimodal features,
 for instance — must be released through the handle so the FIFO orders it
 behind the forward that captured it, not inline.
 
+A speculative prefill pipeline can produce draft context without executing a
+drafter. This does not change the loop or its in-flight depth: projected tap
+rows travel with each chunk's `PPStageState`, and the final stage writes the
+shared arena's draft continuation fields before publishing its final cache
+producer step. The capture collaborator on `ForwardContext` carries behavior;
+no per-request hidden states or projection accumulator live in the control
+plane. The ordinary forward result carries only the bootstrap token, so the
+existing remote completion and first-decode verification contracts apply.
+
 ## Principle 5: publishing drains, once per round
 
 `_publish_scheduler_kv_events` has drain semantics: KV events accumulate

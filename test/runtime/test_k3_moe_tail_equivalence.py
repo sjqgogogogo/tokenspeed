@@ -125,6 +125,7 @@ def _build_comm(device: torch.device, *, latent_tail=None):
 
     world = _world_size()
     comm = object.__new__(K3MoeTailComm)
+    comm.routed_is_combined = False
     comm.hidden_size = H
     comm.routed_hidden = L
 
@@ -374,6 +375,7 @@ def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
     monkeypatch.setattr(mod, "get_is_capture_mode", lambda: True)
 
     comm = object.__new__(mod.K3MoeTailComm)
+    comm.routed_is_combined = False
     comm.latent_tail = SimpleNamespace(
         max_num_tokens=mod.TAIL_FUSION_MAX_TOKENS * 2,
         supports_deferred_finalize=True,
@@ -409,6 +411,7 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
 
     def build(*, supports_deferred, fused_ar):
         comm = object.__new__(mod.K3MoeTailComm)
+        comm.routed_is_combined = False
         comm.latent_tail = SimpleNamespace(
             max_num_tokens=64,
             supports_deferred_finalize=supports_deferred,

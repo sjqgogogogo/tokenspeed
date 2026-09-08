@@ -51,6 +51,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.factory import (
     create_cache_arena,
     create_cache_pool,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+    CacheLayerOwnership,
+    pipeline_cache_ownership,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
@@ -665,7 +669,17 @@ def _create_hybrid_linear_attn_backend(
     # non-spec hybrid decode doesn't get misclassified as target verify /
     # draft extend by `self.spec_num_tokens > 1`.
     if server_args.speculative_algorithm is not None:
-        config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        if server_args.mapping.has_pp:
+            # PP only executes committed prefill state. A KDA backend starts
+            # allocating replay payloads in set_kv_pool, before explicit
+            # workspace preparation, so its verify width must already be one.
+            # Keep the original target/draft configs intact for logical cache
+            # geometry and other backend views.
+            config = dataclasses.replace(config, speculative_num_draft_tokens=1)
+        else:
+            config.speculative_num_draft_tokens = (
+                server_args.speculative_num_draft_tokens
+            )
 
     # The linear component's presence decides whether this model actually
     # has any linear / mamba layers. A draft model on a hybrid-GDN target
@@ -962,16 +976,16 @@ def _prepare_verify_workspace(
 
 
 # ---------- public API ----------
-def _narrow_spec_for_pp(spec: CachePoolSpec, mapping) -> tuple[CachePoolSpec, object]:
+def _narrow_spec_for_pp(
+    spec: CachePoolSpec, ownership: CacheLayerOwnership
+) -> tuple[CachePoolSpec, object]:
     """Chunk-pipeline stage: physically allocate only this stage's layers'
     planes. The logical geometry (parents, packing, page math) stays the
     full model's so every rank's scheduler plans identically; the returned
     full plan serves the PD wire contract (every stage registers the same
     logical layout, Decode plans stage windows against it).
     """
-    from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
-
-    stage_start, stage_end = pp_layer_window(len(spec.layer_types), mapping)
+    stage_start, stage_end = ownership.resident_window
     pp_logical_plan = spec.memory_plan
     spec = dataclasses.replace(
         spec,
@@ -1064,6 +1078,12 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
     )
     spec = cache_setup.spec
+    layer_ownership = pipeline_cache_ownership(
+        cache_setup.num_target_layers,
+        cache_setup.num_draft_layers,
+        server_args.mapping.pp_size,
+        server_args.mapping.pp_layer_partition,
+    )[server_args.mapping.pp_rank]
     target_spec = spec
     draft_view_spec = None
     if cache_setup.num_draft_layers:
@@ -1109,13 +1129,21 @@ def create_attn_components(
     # compute view below (target, draft) is a layer window onto.
     pp_logical_plan = None
     if server_args.mapping.has_pp:
-        spec, pp_logical_plan = _narrow_spec_for_pp(spec, server_args.mapping)
-        target_spec = spec
+        spec, pp_logical_plan = _narrow_spec_for_pp(spec, layer_ownership)
+        target_spec = dataclasses.replace(target_spec, memory_plan=spec.memory_plan)
+        if draft_view_spec is not None:
+            draft_view_spec = dataclasses.replace(
+                draft_view_spec, memory_plan=spec.memory_plan
+            )
     arena = create_cache_arena(
         spec,
         device=config.device,
         enable_memory_saver=enable_memory_saver,
     )
+    # The same owner that selected resident fields also names PD producer
+    # barriers. Do not recount draft layers from its model config: some
+    # drafters have model layers but no independent cache fields.
+    arena.layer_ownership = layer_ownership
     if pp_logical_plan is not None:
         arena.pp_logical_plan = pp_logical_plan
     backend, pool = _create_target_components(
@@ -1133,7 +1161,11 @@ def create_attn_components(
     draft_attn_backend, draft_pool = _create_draft_components(
         server_args=server_args,
         model_config=draft_model_config,
-        config=draft_attn_config,
+        config=(
+            draft_attn_config
+            if not server_args.mapping.has_pp or layer_ownership.owns_draft
+            else None
+        ),
         pool=pool,
         cache_spec=draft_view_spec,
         num_target_layers=cache_setup.num_target_layers,

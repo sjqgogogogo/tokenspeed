@@ -218,6 +218,10 @@ independent of the target sampling backend.
 
 ## Kimi K3
 
+For Hopper MXFP4 serving with pipeline prefill, attention-DP decode, DeepEP,
+DSpark and decode CUDA graphs, see the
+[K3 Hopper PD configuration and validation guide](../guides/kimi-k3-hopper-pd.md).
+
 Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA
 (linear-attention) / NoPE-MLA (full-attention) decoder and a
 DeepSeek-V3-style latent MoE. The KDA layers currently use

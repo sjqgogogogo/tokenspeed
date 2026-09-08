@@ -88,6 +88,7 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
         # Set before super() -- super() starts the server thread, after which a
         # register PUT can call _ingest_put_extra and read these.
         self.prefill_cache_layout_wire: str | None = None
+        self.prefill_num_target_layers: int | None = None
         super().__init__(port)
 
     def _ingest_put_extra(self, data: dict) -> None:
@@ -100,10 +101,43 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
             )
         except (UnicodeEncodeError, ValueError) as exc:
             raise ValueError("CachePD bootstrap layout is invalid") from exc
+        num_target_layers = data["num_target_layers"]
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+            pipeline_cache_ownership,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+            cache_field_layer_id,
+        )
+
+        merged_layers = (
+            max(
+                cache_field_layer_id(field.field_id)
+                for field in cache_layout.plan.fields
+            )
+            + 1
+        )
+        pipeline_cache_ownership(
+            num_target_layers,
+            merged_layers - num_target_layers,
+            int(data.get("pp_size", 1)),
+            (
+                tuple(data["pp_layer_partition"])
+                if data.get("pp_layer_partition")
+                else None
+            ),
+        )
+        if self.prefill_num_target_layers not in (None, num_target_layers):
+            raise ValueError(
+                "CachePD prefill ranks registered incompatible target layers"
+            )
         canonical_wire = cache_layout.to_wire_bytes().decode("ascii")
         if self.prefill_cache_layout_wire not in (None, canonical_wire):
             raise ValueError("CachePD prefill ranks registered incompatible layouts")
         self.prefill_cache_layout_wire = canonical_wire
+        self.prefill_num_target_layers = num_target_layers
 
     def _extra_parallel_info(self) -> dict:
-        return {"cache_layout": self.prefill_cache_layout_wire}
+        return {
+            "cache_layout": self.prefill_cache_layout_wire,
+            "num_target_layers": self.prefill_num_target_layers,
+        }

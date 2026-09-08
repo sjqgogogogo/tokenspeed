@@ -20,6 +20,9 @@
 
 """Factories for PD KV transfer helpers."""
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+    CacheLayerOwnership,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
     build_cache_transfer_schema,
 )
@@ -40,8 +43,8 @@ def get_kv_args(
     token_to_kv_pool,
     *,
     model_config,
-    draft_model_config=None,
-    pp_layer_window: tuple[int, int] | None = None,
+    draft_model_config,
+    layer_ownership: CacheLayerOwnership,
 ):
     # One big model, one arena: a draft's continuation-layer planes live in
     # the target pool's merged plan, so exactly one typed slab registration is
@@ -53,8 +56,7 @@ def get_kv_args(
     )
     producer_schedule = build_cache_fields_by_producer_step(
         token_to_kv_pool.arena.plan,
-        num_target_layers=model_config.num_attention_layers,
-        pp_layer_window=pp_layer_window,
+        ownership=layer_ownership,
     )
     layout, base_addr = build_arena_cache_transfer_contract(
         token_to_kv_pool.arena,
@@ -86,7 +88,7 @@ def get_kv_args(
         gpu_id=gpu_id,
         cache_layout=layout,
         cache_producer_schedule=producer_schedule,
-        pp_layer_window=pp_layer_window,
+        layer_ownership=layer_ownership,
         wire_cache_layout=wire_layout,
     )
 

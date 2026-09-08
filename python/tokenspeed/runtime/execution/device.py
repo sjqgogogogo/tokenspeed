@@ -775,7 +775,11 @@ def build_device_side(
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=token_to_kv_pool.arena.supports_disaggregation,
         supports_pd_layerwise_finalization=bool(
-            getattr(executor.drafter, "supports_pd_layerwise_finalization", False)
+            getattr(
+                executor.context_producer or executor.drafter,
+                "supports_pd_layerwise_finalization",
+                False,
+            )
         ),
         cache_state_group_ids=tuple(
             str(spec.group_id)
@@ -947,15 +951,7 @@ def _build_kv_transfer(
     topology = PDParallelTopology.from_mapping(mapping)
     topology.require_cache_pd_supported()
 
-    pp_layer_window = None
-    if mapping.has_pp:
-        from tokenspeed.runtime.distributed.pp_stage import (
-            pp_layer_window as resolve_pp_layer_window,
-        )
-
-        pp_layer_window = resolve_pp_layer_window(
-            model_config.num_attention_layers, mapping
-        )
+    layer_ownership = executor.token_to_kv_pool.arena.layer_ownership
 
     # PP: transfer-status consensus must span every stage — all ranks run the
     # same deterministic scheduler and must agree on Bootstrapped/Succeeded
@@ -983,7 +979,7 @@ def _build_kv_transfer(
             executor.token_to_kv_pool,
             model_config=model_config,
             draft_model_config=draft_model_config,
-            pp_layer_window=pp_layer_window,
+            layer_ownership=layer_ownership,
         ),
         gloo_group=sync_group,
     )

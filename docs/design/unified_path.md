@@ -233,6 +233,51 @@ decode too. (`_cache_contract_bound` is gone: every LCM pool publishes a
 cache contract, so the target allocates its write-location buffer
 unconditionally and drafts are gated structurally on `is_draft`.)
 
+### Prefill context production and draft execution are separate capabilities
+
+A block draft's prompt cache can be produced without executing its proposal
+network. K3 DSpark uses this on a prefill-only pipeline: each stage loads the
+columns of `context_proj` belonging to the target taps it can compute. The
+last stage additionally owns `context_norm`, every draft layer's KV-a
+projection and KV normalization, and RoPE. No prefill stage loads the draft's
+query projections, dense MLPs, embedding or Markov head.
+
+The numerical contract is `context_norm(sum_i W_i * fc_norm_i(h_i))`, with
+`fc_norm_i` omitted when absent from the checkpoint. Tap indices are the
+checkpoint's ascending positional order. A prefix tap belongs to its completed
+layer; an AttnRes tap belongs to the next layer whose attention-mixing
+parameters it needs (the final tap uses the model's output mix). A boundary
+AttnRes tap is therefore computed at the downstream stage's entry from the
+ordinary inbound AttnRes state. All tap contributions are accumulated in one
+float32 `[num_tokens, draft_hidden]` tensor; the complete sum is cast to the
+draft activation dtype before the single context norm. Split GEMMs can differ
+from a concatenated GEMM by activation rounding; numerical equivalence uses
+bounded error, not bitwise equality.
+
+`PrefillTargetContextProducer` owns projection behavior and the destination
+cache view. Its accumulator belongs to `PPStageState`, never a mutable field
+on the producer or a request-side Python map. The final writer consumes the
+target router's extend-span write locations in target token order. It writes
+the draft's continuation layers in the same LCM arena and publishes one final
+cache producer step for every completed forward chunk, including intermediate
+chunks. A context-only producer does not pass a draft backend into
+`ForwardStepRunner`: no draft forward consumes metadata there. The "one draft
+metadata contract" above applies to executing drafters.
+
+The prefill node sends the sampled bootstrap token with no speculative
+candidates. Decode's existing `force_single_token_verify_buf` seeds legal
+dummy candidates and limits the first verify to one target token while using
+the normal full-width target graph. The same captured step then runs DSpark
+and supplies the next real candidate block. No extra bootstrap forward or
+alternate decode graph is introduced.
+
+Pipeline prefill does not execute the decode-shaped communication warmup:
+its target has no speculative verify scratch, and attention DP is prohibited
+on these stages. K3's collective workspaces are armed in model construction,
+DeepEP storage is prepared during weight loading before cache profiling, and
+stage TP peers initialize remaining lazy state together on their first
+prefill.
+
 ### Sampling has no greedy branch
 
 Greedy requests normalize to `top_k=1` in `SamplingParams.__post_init__`; the

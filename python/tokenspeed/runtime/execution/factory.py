@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from typing import TYPE_CHECKING
 
 import tokenspeed.runtime.layers.attention.backends  # noqa: F401  # trigger register_backend() calls
@@ -86,6 +87,24 @@ def _wire_draft_to_target_model(
     budget, so weights the draft shares with the target (embed/LM head) are
     released before profiling instead of being double-counted.
     """
+    if getattr(draft_model_runner.model, "is_context_only", False) is True:
+        draft_model = draft_model_runner.model
+        setter = getattr(model_runner.model, "set_prefill_context_capture", None)
+        if setter is None:
+            raise ValueError("The target does not support pipeline context projection")
+        from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
+            validate_k3_dspark_config,
+        )
+
+        validate_k3_dspark_config(
+            draft_model.config, model_runner.model_config.hf_text_config
+        )
+        setter(
+            list(draft_model.config.target_layer_ids),
+            draft_model.config.aux_hidden_stream,
+            draft_model.hidden_size,
+        )
+        return
     DrafterImpl = get_drafter_impl(
         server_args.speculative_algorithm, draft_model_runner.model
     )
@@ -129,6 +148,21 @@ def create_model_runner(
 
     draft_model_runner = None
     if draft_model_config is not None:
+        if server_args.mapping.has_pp and server_args.speculative_algorithm is not None:
+            if (
+                server_args.disaggregation_mode != "prefill"
+                or server_args.speculative_algorithm != "DSPARK"
+                or getattr(draft_model_config.hf_config, "model_type", None)
+                != "k3_dspark"
+            ):
+                raise ValueError(
+                    "Pipeline speculation requires a Kimi-K3 DSpark context producer on a prefill node"
+                )
+            # Keep the logical draft config intact for cache geometry. The
+            # loader selects only the parameter subset this stage consumes.
+            draft_model_config = copy(draft_model_config)
+            draft_model_config.hf_config = copy(draft_model_config.hf_config)
+            draft_model_config.hf_config.architectures = ["K3DSparkContextModel"]
         draft_model_runner = ModelRunner(
             model_config=draft_model_config,
             gpu_id=gpu_id,

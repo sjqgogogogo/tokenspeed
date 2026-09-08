@@ -32,6 +32,11 @@ this file. Exercise it with:
 ``torchrun --standalone --nproc-per-node=2 -m pytest -q <this file>``
 ``TEST_DEEPEP_MODE=low_latency torchrun --standalone --nproc-per-node=2 \
   -m pytest -q <this file>``
+
+The same test supports a four-node torchrun world of 32 ranks. Set
+``TEST_K3_MOE_GEOMETRY=1`` for 896 experts/top-16/latent-3584, and optionally
+``TEST_MOE_INTERMEDIATE_SIZE=3072`` for full K3 expert GEMM dimensions.
+The low-latency invocation also replays CUDA graphs with changed routing.
 """
 
 from __future__ import annotations
@@ -56,8 +61,8 @@ def _deepep_mode() -> str:
 
 
 @pytest.mark.skipif(
-    _world_size() not in {2, 4, 8},
-    reason="launch with torchrun world size 2, 4, or 8",
+    _world_size() not in {2, 4, 8, 32},
+    reason="launch with torchrun world size 2, 4, 8, or 32",
 )
 def test_marlin_deepep_matches_replicated_reference() -> None:
     import tokenspeed_kernel
@@ -71,13 +76,17 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
 
     # All ranks share the same weights (same seed); each holds its own tokens.
     generator = torch.Generator(device="cuda").manual_seed(20260822)
-    num_experts = 4 * world_size
+    k3_geometry = os.environ.get("TEST_K3_MOE_GEOMETRY", "0") == "1"
+    num_experts = 896 if k3_geometry else 4 * world_size
     num_local = num_experts // world_size
-    top_k = 4
-    # The DeepEP low-latency kernels are compiled for a fixed hidden-size list
-    # (2048 is the smallest, and also K3's routed latent width).
-    hidden_size, intermediate_size = 2048, 256
-    num_tokens = 16
+    top_k = 16 if k3_geometry else 4
+    hidden_size = 3584 if k3_geometry else 2048
+    intermediate_size = int(os.environ.get("TEST_MOE_INTERMEDIATE_SIZE", "256"))
+    capacity = 16
+    # Rank zero is idle while peers send uneven batches; every rank still
+    # receives and computes its experts. Keep capacity uniform across ranks.
+    source_counts = [0] + [1 + peer % capacity for peer in range(1, world_size)]
+    num_tokens = source_counts[rank]
     beta, linear_beta = 4.0, 25.0
 
     raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
@@ -92,16 +101,19 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         )
         * 0.2
     ).to(torch.bfloat16)
-    topk_ids = torch.stack(
-        [
-            torch.randperm(num_experts, generator=rank_gen, device="cuda")[:top_k]
-            for _ in range(num_tokens)
-        ]
-    ).to(torch.int32)
+    topk_ids = (
+        torch.rand((num_tokens, num_experts), generator=rank_gen, device="cuda")
+        .argsort(dim=1)[:, :top_k]
+        .to(torch.int32)
+        .contiguous()
+    )
     topk_weights = torch.rand(
         num_tokens, top_k, generator=rank_gen, device="cuda", dtype=torch.float32
     )
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
+    if num_tokens and rank % 2:
+        topk_ids[-1].fill_(-1)
+        topk_weights[-1].zero_()
 
     expected = mxfp4_moe_reference(
         x,
@@ -144,7 +156,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         deepep_group=dist.group.WORLD,
         deepep_mode=mode,
         deepep_low_latency_max_num_tokens_per_gpu=(
-            num_tokens if mode == "low_latency" else None
+            capacity if mode == "low_latency" else None
         ),
         solution="marlin",
     )
@@ -158,8 +170,57 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         torch.zeros((num_tokens, num_experts), dtype=torch.float32, device="cuda"),
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        num_tokens_global=sum(source_counts),
         low_latency=(mode == "low_latency"),
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
     dist.barrier()
+    if mode == "low_latency":
+        logits = torch.zeros(
+            (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+        )
+
+        def apply():
+            return tokenspeed_kernel.moe_apply(
+                plan,
+                x,
+                module,
+                logits,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                num_tokens_global=sum(source_counts),
+                low_latency=True,
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                apply()
+        torch.cuda.current_stream().wait_stream(stream)
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = apply()
+        for shift in (1, 7):
+            topk_ids.copy_(
+                torch.where(topk_ids < 0, topk_ids, (topk_ids + shift) % num_experts)
+            )
+            expected = mxfp4_moe_reference(
+                x,
+                raw["w13_weight"],
+                raw["w13_scale"],
+                raw["w2_weight"],
+                raw["w2_scale"],
+                topk_ids,
+                topk_weights,
+                activation_dtype=torch.bfloat16,
+                situ_beta=beta,
+                situ_linear_beta=linear_beta,
+            )
+            graph.replay()
+            torch.testing.assert_close(
+                captured.float(), expected.float(), atol=5e-2, rtol=5e-2
+            )
+        dist.barrier()

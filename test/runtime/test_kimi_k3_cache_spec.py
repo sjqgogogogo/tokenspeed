@@ -292,3 +292,29 @@ def test_k3_binding_utilization_with_real_bf16_draft_geometry():
     widened = merged.capacity_report()
     assert abs(widened["full_attention"]["binding_utilization"] - 1.0) < 1e-3
     assert abs(widened["linear_attention_0"]["binding_utilization"] - 0.6224) < 1e-3
+
+
+def test_pp_context_only_workspace_preserves_non_pp_prefill_warmup() -> None:
+    from types import SimpleNamespace
+
+    recipe, _, _ = kimi_tp8_layout(
+        text_config=None,
+        tp_size=8,
+        draft_layers=5,
+        pd_enabled=True,
+        max_bs=4,
+        max_scheduled_tokens=128,
+        context_len=4096,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+        kv_cache_dtype=torch.float8_e4m3fn,
+    )
+    # Pin the fallback layout so this geometry test is device-independent.
+    recipe.replay_kda = False
+    recipe.server_args.disaggregation_mode = "prefill"
+    recipe.server_args.mapping = SimpleNamespace(has_pp=True)
+    assert recipe.workspace_bytes() == 0
+    recipe.server_args.mapping.has_pp = False
+    assert recipe.workspace_bytes() == 2_022_174_720
