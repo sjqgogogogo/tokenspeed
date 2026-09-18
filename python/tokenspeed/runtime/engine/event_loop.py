@@ -67,6 +67,7 @@ from tokenspeed.runtime.execution.distributed_initializer import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
+    LogprobRequestConfig,
     PendingExecution,
     PlannedForward,
 )
@@ -1020,6 +1021,7 @@ class EventLoop:
                         # pop them from output_processor.rid_to_state, which would
                         # KeyError on rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
+                        logprob_configs = self._gather_logprob_configs(forward_op)
                         grammar_inputs = self._gather_grammar_state(forward_op)
                         ngram_inputs = ngram_inputs_for_forward(
                             forward_op,
@@ -1037,6 +1039,7 @@ class EventLoop:
                         planned = PlannedForward(
                             forward_op=forward_op,
                             sampling_params_list=sampling_params_list,
+                            logprob_configs=logprob_configs,
                             dp_metadata=dp_metadata,
                             grammar_inputs=grammar_inputs,
                             ngram_inputs=ngram_inputs,
@@ -1107,6 +1110,44 @@ class EventLoop:
             st = rid_to_state.get(rid)
             if st is not None:
                 st.stats.mark_scheduled(now)
+
+    def _gather_logprob_configs(self, forward_op) -> tuple[LogprobRequestConfig, ...]:
+        """Freeze CPU controls and each chunk's true next-prompt token ids.
+
+        Source t predicts prompt token t+1, including across chunk boundaries.
+        The final prompt source (and any later retraction replay rows) uses a
+        valid dummy id; commit discards those rows instead of exposing a score.
+        """
+        num_extends = forward_op.num_extends()
+        configs = []
+        for index, rid in enumerate(forward_op.request_ids):
+            state = self.output_processor.rid_to_state[rid]
+            target_ids = ()
+            if (
+                index < num_extends
+                and state.return_logprob
+                and state.logprob_start_len >= 0
+            ):
+                source_start = int(forward_op.extend_prefix_lens[index])
+                length = int(forward_op.input_lengths[index])
+                if source_start < 0 or length <= 0:
+                    raise ValueError(
+                        "Input logprob chunk must have a valid source range"
+                    )
+                prompt = state.prompt_input_ids
+                target_ids = tuple(
+                    int(prompt[source + 1]) if source + 1 < len(prompt) else 0
+                    for source in range(source_start, source_start + length)
+                )
+            configs.append(
+                LogprobRequestConfig(
+                    return_logprob=state.return_logprob,
+                    logprob_start_len=state.logprob_start_len,
+                    top_logprobs_num=state.top_logprobs_num,
+                    input_token_ids=target_ids,
+                )
+            )
+        return tuple(configs)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The

@@ -32,6 +32,10 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.logprob_utils import (
+        RawLogitsSnapshot,
+        TopLogprobCapture,
+    )
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
@@ -132,6 +136,12 @@ class ForwardContext:
     # Set by a target model that captures its taps on a narrowed row subset
     # (see CapturedRows); None means one captured row per input row.
     captured_rows: CapturedRows | None = None
+    # Per-forward diagnostic sink; absent on the normal serving path.
+    top_logprob_capture: TopLogprobCapture | None = None
+    # Capture-time copy destination; only the opt-in diagnostic graph owns one.
+    raw_logit_snapshot: RawLogitsSnapshot | None = None
+    # Also marks input-only K=0 requests, whose decode uses the original graph.
+    logprob_diagnostic: bool = False
 
     # --- spec-decode draft (drafter-attached collaborators, per forward) ---
     # Set on the draft forwards that narrow verify-shaped rows to the

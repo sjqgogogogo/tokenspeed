@@ -148,7 +148,13 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     executor._draft_final_step_counter = SimpleNamespace(
         record_cache=lambda: events.append("draft-final")
     )
-    ctx = SimpleNamespace(bs=1, num_extends=1, input_num_tokens=1)
+    ctx = SimpleNamespace(
+        bs=1,
+        num_extends=1,
+        input_num_tokens=1,
+        top_logprob_capture=None,
+        raw_logit_snapshot=None,
+    )
 
     executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
 

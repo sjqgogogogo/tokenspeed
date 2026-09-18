@@ -930,6 +930,7 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         grammar_inputs=None,
         multimodal_context=None,
         ngram_inputs=snapshot,
+        logprob_configs=(),
     )
     pending = handle._submit_forward(planned, capture_next_input_ids=False)
     states["a"].prompt_input_ids.clear()

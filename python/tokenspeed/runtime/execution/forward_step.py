@@ -41,6 +41,7 @@ from tokenspeed.runtime.execution.graph_ptr_guard import (
     snapshot_graph_metadata,
     verify_graph_metadata,
 )
+from tokenspeed.runtime.execution.logprob_utils import RawLogitsSnapshot
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
 )
@@ -286,11 +287,38 @@ class ForwardStepRunner:
 
         self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
+        self.diagnostic_graphs: dict[tuple[str, int], object] = {}
+        self.diagnostic_output_buffers: dict[tuple[str, int], tuple] = {}
+        self.diagnostic_graph_replays = 0
+        self._diagnostic_logits = None
+        if config.enable_logprob_graph:
+            if (
+                self.device != "cuda"
+                or self.disable
+                or self.max_tokens_per_req != 1
+                or self.dp_size != 1
+                or config.pp_size != 1
+                or config.overlap_schedule_depth != 0
+                or config.dp_sampling
+                or not config.disable_prefill_graph
+            ):
+                raise ValueError(
+                    "Logprob graphs require CUDA decode graphs, no overlap/spec/DP/PP, "
+                    "and --disable-prefill-graph"
+                )
+            # Allocated outside every graph pool; all ladder/variant views share
+            # this one address-stable backing allocation. Only diagnostic graphs
+            # record a copy to it. Dynamic K work runs after replay.
+            self._diagnostic_logits = torch.empty(
+                (self.max_capture_bs, self.vocab_size),
+                dtype=torch.float32,
+                device=self.device,
+            )
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
         self._graph_debug = graph_debug_enabled()
-        self._metadata_snapshots: dict[tuple[str, int], dict[str, dict]] = {}
+        self._metadata_snapshots: dict[tuple[str, int, bool], dict[str, dict]] = {}
 
         self._forward_func: Callable | None = forward_func
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -336,9 +364,21 @@ class ForwardStepRunner:
                     capture_range.set_description(
                         f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
                     )
-                graph, output_buffers = self._capture_one(bs, variant=variant)
+                graph, output_buffers = self._capture_one(
+                    bs, variant=variant, logprob_snapshot=None
+                )
                 self.graphs[(variant, bs)] = graph
                 self.output_buffers[(variant, bs)] = output_buffers
+                if self._diagnostic_logits is not None:
+                    graph, output_buffers = self._capture_one(
+                        bs,
+                        variant=variant,
+                        logprob_snapshot=RawLogitsSnapshot(
+                            self._diagnostic_logits[:bs]
+                        ),
+                    )
+                    self.diagnostic_graphs[(variant, bs)] = graph
+                    self.diagnostic_output_buffers[(variant, bs)] = output_buffers
 
     def _cuda_graph_capture_variants(self) -> tuple[str, ...]:
         if self.sampling_backend is None:
@@ -386,12 +426,14 @@ class ForwardStepRunner:
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
-    def _verify_graph_metadata(self, graph_key: tuple[str, int]) -> None:
+    def _verify_graph_metadata(self, graph_key: tuple[str, int, bool]) -> None:
         """Assert the refresh rebound the tensors the captured graph reads."""
         snapshots = self._metadata_snapshots.get(graph_key)
         if snapshots is None:
             return
-        context = f"variant={graph_key[0]!r}, bs={graph_key[1]}"
+        context = (
+            f"variant={graph_key[0]!r}, bs={graph_key[1]}, diagnostic={graph_key[2]}"
+        )
         verify_graph_metadata(
             self.attn_backend, snapshots["target"], context=f"target, {context}"
         )
@@ -400,7 +442,9 @@ class ForwardStepRunner:
                 self.draft_attn_backend, snapshots["draft"], context=f"draft, {context}"
             )
 
-    def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
+    def _capture_one(
+        self, bs: int, variant: str, logprob_snapshot: RawLogitsSnapshot | None
+    ):
         graph_cls = (
             self.device_module.NPUGraph
             if self.device == "npu"
@@ -428,6 +472,7 @@ class ForwardStepRunner:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
+            raw_logit_snapshot=logprob_snapshot,
         )
 
         # For DP mode, global_num_tokens must be set so that the MoE
@@ -564,7 +609,9 @@ class ForwardStepRunner:
             snapshots = {"target": snapshot_graph_metadata(self.attn_backend)}
             if self.draft_attn_backend is not None:
                 snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
-            self._metadata_snapshots[(variant, bs)] = snapshots
+            self._metadata_snapshots[(variant, bs, logprob_snapshot is not None)] = (
+                snapshots
+            )
 
         return graph, out
 
@@ -902,6 +949,12 @@ class ForwardStepRunner:
         the tables without waiting on the device.
         """
         use_graph = self._can_use_graph(bs, ctx)
+        diagnostic = ctx.logprob_diagnostic and self.config.enable_logprob_graph
+        if diagnostic and ctx.forward_mode.is_decode() and not use_graph:
+            raise RuntimeError(
+                "Diagnostic decode requires actual CUDA graph replay; "
+                "batch size is outside the available capture ladder"
+            )
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
@@ -985,9 +1038,22 @@ class ForwardStepRunner:
             self.deepep_adapter.replay()
 
             graph_key = self._cuda_graph_key(padded_bs)
-            graph = self.graphs[graph_key]
+            needs_snapshot = ctx.top_logprob_capture is not None
+            if needs_snapshot and not diagnostic:
+                raise RuntimeError("Graph Top-K requires --enable-logprob-graph")
+            graphs = self.diagnostic_graphs if needs_snapshot else self.graphs
+            buffers = (
+                self.diagnostic_output_buffers
+                if needs_snapshot
+                else self.output_buffers
+            )
+            if graph_key not in graphs:
+                raise RuntimeError(
+                    "Requested logprob CUDA graph variant was not captured"
+                )
+            graph = graphs[graph_key]
             if self._graph_debug:
-                self._verify_graph_metadata(graph_key)
+                self._verify_graph_metadata((*graph_key, needs_snapshot))
             if self.device == "npu":
                 graph.update(
                     cpu_update_input=[
@@ -996,12 +1062,29 @@ class ForwardStepRunner:
                 )
             with nvtx_range("graph_replay", color="red"):
                 graph.replay()
+            if needs_snapshot:
+                ctx.top_logprob_capture.capture_replayed_logits(
+                    self._diagnostic_logits[:bs]
+                )
+            if diagnostic:
+                self.diagnostic_graph_replays += 1
+                if self._graph_debug:
+                    logger.info(
+                        "LOGPROB_GRAPH_REPLAY rank=%s count=%s live_bs=%s padded_bs=%s "
+                        "variant=%s snapshot=%s",
+                        self.global_rank,
+                        self.diagnostic_graph_replays,
+                        bs,
+                        padded_bs,
+                        graph_key[0],
+                        needs_snapshot,
+                    )
 
             (
                 output_tokens,
                 output_lengths,
                 output_logprobs,
-            ) = self.output_buffers[graph_key]
+            ) = buffers[graph_key]
 
             result = (
                 output_tokens[: bs * self.max_tokens_per_req],

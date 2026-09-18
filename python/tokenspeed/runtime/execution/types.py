@@ -66,6 +66,16 @@ class NGramInputs:
 
 
 @dataclass(frozen=True)
+class LogprobRequestConfig:
+    """Immutable per-request diagnostic controls captured before dispatch."""
+
+    return_logprob: bool
+    logprob_start_len: int
+    top_logprobs_num: int
+    input_token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class PlannedForward:
     """One round's planned work, as the device side needs to see it.
 
@@ -90,6 +100,8 @@ class PlannedForward:
         multimodal_context: Per-batch multimodal state, None for text-only.
             Its ``mm_inputs`` are shallow copies taken at gather time; the
             items inside are the other registered exception.
+        logprob_configs: Immutable per-request CPU controls for optional
+            pre-sampling Top-K collection, in the forward request order.
     """
 
     forward_op: Any
@@ -98,6 +110,7 @@ class PlannedForward:
     grammar_inputs: Any
     multimodal_context: Any
     ngram_inputs: NGramInputs | None
+    logprob_configs: tuple[LogprobRequestConfig, ...]
 
 
 @dataclass
@@ -120,6 +133,11 @@ class ModelExecutionResult:
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
+    input_token_logprobs: list[torch.Tensor | None] | None = None
+    input_top_logprobs_val: list[torch.Tensor | None] | None = None
+    input_top_logprobs_idx: list[torch.Tensor | None] | None = None
+    output_top_logprobs_val: torch.Tensor | None = None
+    output_top_logprobs_idx: torch.Tensor | None = None
     # P role, final chunk only: the sampled rows the commit path folds into
     # the ExtendResult as the bootstrap payload the peer's decode needs.
     next_input_ids: torch.Tensor | None = None

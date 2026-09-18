@@ -98,6 +98,14 @@ class RequestState:
         self.return_logprob = return_logprob
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
+        self.logprob_start_len = -1
+        self.input_token_logprobs_val: list = []
+        self.input_token_logprobs_idx: list = []
+        self.input_top_logprobs_val: list = []
+        self.input_top_logprobs_idx: list = []
+        self.output_top_logprobs_val: list = []
+        self.output_top_logprobs_idx: list = []
+        self.input_logprobs_sent = False
 
         # --- generation state (updated with forward step) ---
         self.output_ids: list[int] = []
@@ -163,7 +171,7 @@ class RequestState:
         tokenizer,
         eos_token_ids: list[int],
     ) -> RequestState:
-        return cls(
+        state = cls(
             prompt_input_ids=recv_req.input_ids,
             sampling_params=recv_req.sampling_params,
             stream=recv_req.stream,
@@ -176,6 +184,86 @@ class RequestState:
             prompt_input_ids_unpadded=getattr(recv_req, "input_ids_unpadded", None),
             created_time=getattr(recv_req, "created_time", 0.0),
         )
+        state.logprob_start_len = recv_req.logprob_start_len
+        return state
+
+    def append_prompt_token_logprobs(
+        self, values, source_start: int, source_length: int
+    ) -> None:
+        """Align a CPU chunk's true next-input-token scores to prompt IDs."""
+        if not self.return_logprob or self.logprob_start_len < 0:
+            return
+        if values is None:
+            raise RuntimeError("Requested prompt token logprobs are missing")
+        if values.device.type != "cpu":
+            raise RuntimeError("Prompt token logprobs must be CPU tensors")
+        if values.ndim != 1 or values.shape[0] != source_length:
+            raise RuntimeError("Prompt token logprob chunk shape does not match")
+        if self.logprob_start_len == 0 and not self.input_token_logprobs_val:
+            self.input_token_logprobs_val.append(None)
+            self.input_token_logprobs_idx.append(self.prompt_input_ids[0])
+        for row, value in enumerate(values.tolist()):
+            target = source_start + row + 1
+            if target >= self.input_length or target < self.logprob_start_len:
+                continue
+            expected = self.logprob_start_len + len(self.input_token_logprobs_val)
+            if target < expected:
+                continue
+            if target != expected:
+                raise RuntimeError(
+                    f"Prompt token logprobs have a position gap: expected {expected}, got {target}"
+                )
+            self.input_token_logprobs_val.append(value)
+            self.input_token_logprobs_idx.append(self.prompt_input_ids[target])
+
+    def append_prompt_top_logprobs(
+        self, values, indices, source_start: int, source_length: int
+    ) -> None:
+        """Consume one CPU chunk's next-token distributions at prompt indices.
+
+        Source row ``j`` scores token ``source_start + j + 1``. The final
+        prompt source row belongs to the first output, not to input logprobs.
+        Recomputed positions after retraction are not emitted twice.
+        """
+        if (
+            not self.return_logprob
+            or self.top_logprobs_num == 0
+            or self.logprob_start_len < 0
+        ):
+            return
+        if values is None or indices is None:
+            raise RuntimeError(
+                "Requested prompt Top-K is missing from the execution result"
+            )
+        if values.device.type != "cpu" or indices.device.type != "cpu":
+            raise RuntimeError(
+                "Prompt Top-K must cross the commit boundary as CPU tensors"
+            )
+        if (
+            values.ndim != 2
+            or values.shape != indices.shape
+            or values.shape[0] != source_length
+            or values.shape[1] < self.top_logprobs_num
+        ):
+            raise RuntimeError("Prompt Top-K chunk shape does not match the forward op")
+        if self.logprob_start_len == 0 and not self.input_top_logprobs_val:
+            self.input_top_logprobs_val.append(None)
+            self.input_top_logprobs_idx.append(None)
+        rows_val = values[:, : self.top_logprobs_num].tolist()
+        rows_idx = indices[:, : self.top_logprobs_num].tolist()
+        for row, (row_val, row_idx) in enumerate(zip(rows_val, rows_idx)):
+            target = source_start + row + 1
+            if target >= self.input_length or target < self.logprob_start_len:
+                continue
+            expected = self.logprob_start_len + len(self.input_top_logprobs_val)
+            if target < expected:
+                continue
+            if target != expected:
+                raise RuntimeError(
+                    f"Prompt Top-K has a position gap: expected {expected}, got {target}"
+                )
+            self.input_top_logprobs_val.append(row_val)
+            self.input_top_logprobs_idx.append(row_idx)
 
     @property
     def finished(self) -> bool:
@@ -712,6 +800,26 @@ class OutputProcesser:
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
+            if (
+                not is_decode_slot
+                and request_state.return_logprob
+                and request_state.logprob_start_len >= 0
+            ):
+                prompt_sampled = model_execution_results.input_token_logprobs
+                request_state.append_prompt_token_logprobs(
+                    prompt_sampled[i] if prompt_sampled is not None else None,
+                    forward_op.extend_prefix_lens[i],
+                    forward_op.input_lengths[i],
+                )
+                prompt_vals = model_execution_results.input_top_logprobs_val
+                prompt_idxs = model_execution_results.input_top_logprobs_idx
+                request_state.append_prompt_top_logprobs(
+                    prompt_vals[i] if prompt_vals is not None else None,
+                    prompt_idxs[i] if prompt_idxs is not None else None,
+                    forward_op.extend_prefix_lens[i],
+                    forward_op.input_lengths[i],
+                )
+
             # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
             # retract; C++ owes no token and the sampled one is garbage).
             # Fresh requests: prefill_length == prompt length, same as the gate below.
@@ -800,6 +908,35 @@ class OutputProcesser:
                 else -1
             )
             new_ids = []
+            model_top_vals = None
+            model_top_idxs = None
+            if request_state.return_logprob and request_state.top_logprobs_num > 0:
+                top_vals = model_execution_results.output_top_logprobs_val
+                top_idxs = model_execution_results.output_top_logprobs_idx
+                if top_vals is None or top_idxs is None:
+                    raise RuntimeError(
+                        "Requested output Top-K is missing from the execution result"
+                    )
+                if top_vals.device.type != "cpu" or top_idxs.device.type != "cpu":
+                    raise RuntimeError(
+                        "Output Top-K must cross the commit boundary as CPU tensors"
+                    )
+                if (
+                    top_vals.ndim != 3
+                    or top_vals.shape != top_idxs.shape
+                    or top_vals.shape[0] != len(forward_op.request_ids)
+                    or top_vals.shape[1] < len(model_output_ids)
+                    or top_vals.shape[2] < request_state.top_logprobs_num
+                ):
+                    raise RuntimeError(
+                        "Output Top-K shape does not match sampled output tokens"
+                    )
+                model_top_vals = top_vals[
+                    i, :, : request_state.top_logprobs_num
+                ].tolist()
+                model_top_idxs = top_idxs[
+                    i, :, : request_state.top_logprobs_num
+                ].tolist()
             for j, model_output_id in enumerate(model_output_ids):
                 request_state.output_ids.append(model_output_id)
                 if advance_grammar:
@@ -813,6 +950,9 @@ class OutputProcesser:
                         model_output_logprobs[j]
                     )
                     request_state.output_token_logprobs_idx.append(model_output_id)
+                if model_top_vals is not None:
+                    request_state.output_top_logprobs_val.append(model_top_vals[j])
+                    request_state.output_top_logprobs_idx.append(model_top_idxs[j])
                 if term_idx == j:
                     # Grammar termination takes precedence over
                     # length/EOS/stop_str at the same step (matching
@@ -1038,6 +1178,13 @@ class OutputProcesser:
         output_extra_infos: list[dict] = []
         output_token_logprobs_val: list[list[float]] = []
         output_token_logprobs_idx: list[list[int]] = []
+        input_token_logprobs_val: list[list] = []
+        input_token_logprobs_idx: list[list] = []
+        input_top_logprobs_val: list[list] = []
+        input_top_logprobs_idx: list[list] = []
+        output_top_logprobs_val: list[list] = []
+        output_top_logprobs_idx: list[list] = []
+        has_diagnostic_logprobs = False
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -1071,6 +1218,9 @@ class OutputProcesser:
                 continue
 
             rids_to_send.append(stream_out_rids[i])
+            has_diagnostic_logprobs |= rs.return_logprob and (
+                rs.logprob_start_len >= 0 or rs.top_logprobs_num > 0
+            )
             send_token_offset = rs.send_token_offset
 
             finished_reasons.append(
@@ -1117,9 +1267,71 @@ class OutputProcesser:
                 output_token_logprobs_val.append([])
                 output_token_logprobs_idx.append([])
 
+            if rs.return_logprob and rs.top_logprobs_num > 0:
+                if not (
+                    len(rs.output_top_logprobs_val)
+                    == len(rs.output_top_logprobs_idx)
+                    == rs.output_length
+                ):
+                    raise RuntimeError(
+                        "Output Top-K positions do not match generated token IDs"
+                    )
+                output_top_logprobs_val.append(
+                    rs.output_top_logprobs_val[send_token_offset:]
+                )
+                output_top_logprobs_idx.append(
+                    rs.output_top_logprobs_idx[send_token_offset:]
+                )
+                if rs.logprob_start_len >= 0 and not rs.input_logprobs_sent:
+                    expected = rs.input_length - rs.logprob_start_len
+                    if (
+                        rs.prefill_finished
+                        and len(rs.input_top_logprobs_val) != expected
+                    ):
+                        raise RuntimeError(
+                            "Prompt Top-K is incomplete at the end of prefill"
+                        )
+                    input_top_logprobs_val.append(rs.input_top_logprobs_val.copy())
+                    input_top_logprobs_idx.append(rs.input_top_logprobs_idx.copy())
+                else:
+                    input_top_logprobs_val.append([])
+                    input_top_logprobs_idx.append([])
+            else:
+                input_top_logprobs_val.append([])
+                input_top_logprobs_idx.append([])
+                output_top_logprobs_val.append([])
+                output_top_logprobs_idx.append([])
+
+            if (
+                rs.return_logprob
+                and rs.logprob_start_len >= 0
+                and not rs.input_logprobs_sent
+            ):
+                expected = rs.input_length - rs.logprob_start_len
+                if rs.prefill_finished and len(rs.input_token_logprobs_val) != expected:
+                    raise RuntimeError(
+                        "Prompt token logprobs are incomplete at prefill end"
+                    )
+                input_token_logprobs_val.append(rs.input_token_logprobs_val.copy())
+                input_token_logprobs_idx.append(rs.input_token_logprobs_idx.copy())
+                rs.input_logprobs_sent = True
+            else:
+                input_token_logprobs_val.append([])
+                input_token_logprobs_idx.append([])
+
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
             return
+
+        if not has_diagnostic_logprobs:
+            # Preserve the pre-diagnostic wire payload for ordinary generation
+            # and sampled-output-only requests, including service WARMUP.
+            input_token_logprobs_val = []
+            input_token_logprobs_idx = []
+            input_top_logprobs_val = []
+            input_top_logprobs_idx = []
+            output_top_logprobs_val = []
+            output_top_logprobs_idx = []
 
         batch_id_out = BatchTokenIDOut(
             rids=rids_to_send,
@@ -1136,14 +1348,14 @@ class OutputProcesser:
             completion_tokens=completion_tokens,
             cached_tokens=cached_tokens,
             spec_verify_ct=spec_verify_ct,
-            input_token_logprobs_val=[],
-            input_token_logprobs_idx=[],
+            input_token_logprobs_val=input_token_logprobs_val,
+            input_token_logprobs_idx=input_token_logprobs_idx,
             output_token_logprobs_val=output_token_logprobs_val,
             output_token_logprobs_idx=output_token_logprobs_idx,
-            input_top_logprobs_val=[],
-            input_top_logprobs_idx=[],
-            output_top_logprobs_val=[],
-            output_top_logprobs_idx=[],
+            input_top_logprobs_val=input_top_logprobs_val,
+            input_top_logprobs_idx=input_top_logprobs_idx,
+            output_top_logprobs_val=output_top_logprobs_val,
+            output_top_logprobs_idx=output_top_logprobs_idx,
             input_token_ids_logprobs_val=[],
             input_token_ids_logprobs_idx=[],
             output_token_ids_logprobs_val=[],

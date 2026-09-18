@@ -414,6 +414,7 @@ class DeviceHandle:
             return executor.execute_forward_op(
                 planned.forward_op,
                 planned.sampling_params_list,
+                logprob_configs=planned.logprob_configs,
                 dp_metadata=planned.dp_metadata,
                 grammar_inputs=planned.grammar_inputs,
                 multimodal_context=planned.multimodal_context,

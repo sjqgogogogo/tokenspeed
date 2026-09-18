@@ -286,6 +286,11 @@ class ServerArgs:
     # captured CUDA-graph footprint; requests asking for logprobs on a
     # server started without the matching flag will receive empty logprobs.
     enable_output_logprobs: bool = False
+    # Opt-in prompt Top-K diagnostics; not an export of full-vocabulary logits.
+    # Requests also require enable_output_logprobs.
+    enable_input_logprobs: bool = False
+    # Experimental diagnostic decode graphs; prompt scoring remains eager.
+    enable_logprob_graph: bool = False
 
     # Runtime options
     disable_pdl: bool = False
@@ -1805,6 +1810,27 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_output_logprobs,
             help="Enable per-token sampled-token logprobs. OFF by default; enabling extends the captured CUDA-graph footprint. Requests asking for logprobs on a server without this flag receive empty logprobs.",
+        )
+        parser.add_argument(
+            "--enable-input-logprobs",
+            action="store_true",
+            default=ServerArgs.enable_input_logprobs,
+            help=(
+                "Enable opt-in prompt Top-K diagnostics. OFF by default; requires "
+                "--enable-output-logprobs and requests with return_logprob=True, "
+                "logprob_start_len >= 0. Collects actual input-token logprobs "
+                "and optional Top-K; does not export full-vocabulary logits."
+            ),
+        )
+        parser.add_argument(
+            "--enable-logprob-graph",
+            action="store_true",
+            default=ServerArgs.enable_logprob_graph,
+            help=(
+                "Enable experimental CUDA Graph decode for logprob diagnostics. "
+                "Requires CUDA and --disable-prefill-graph; do not combine with "
+                "--enforce-eager. All other diagnostic restrictions still apply."
+            ),
         )
         parser.add_argument(
             "--eagle3-layers-to-capture",
