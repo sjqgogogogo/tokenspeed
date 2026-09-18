@@ -49,9 +49,6 @@ struct SchedulerConfig {
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
-    // Caller-declared transient history writes after each prefill chunk.
-    // Zero preserves ordinary prefill admission, regardless of decode width.
-    std::int32_t prefill_workspace_tokens{0};
     // Number of scheduler iterations that may be dispatched before the
     // accepted decode length is committed. The current event loop supports
     // only the non-overlapped (0) and one-step-overlapped (1) contracts.
@@ -81,6 +78,9 @@ struct SchedulerConfig {
     // and the cache coordinator assert on the same fields and their assertions
     // would otherwise preempt these diagnostics.
     void Validate() const;
+    // The subset of Validate() the CapacityModel needs: every field it reads
+    // to size a pool, none of the page counts that describe a sized one.
+    void ValidateCapacityInputs() const;
 };
 
 }  // namespace tokenspeed

@@ -114,6 +114,8 @@ def _recipe(device):
             chunked_prefill_size=512,
             max_num_seqs=2,
             max_total_tokens=1024,
+            disaggregation_mode="null",
+            enable_prefix_caching=True,
         ),
         model_config=SimpleNamespace(
             num_attention_layers=40,
@@ -1188,6 +1190,8 @@ def test_pd_contract_plan_and_manifest():
         decode_tp_size=2,
         prefill_layout=contract,
         decode_layout=contract,
+        # A single-stage prefill owns every field.
+        prefill_field_ids=None,
     )
     for decode_rank, source in ((0, 0), (1, 2)):
         plan = planner.plan_for_decode_rank(decode_rank)

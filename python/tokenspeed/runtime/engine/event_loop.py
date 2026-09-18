@@ -51,8 +51,8 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
-    resolve_prefill_workspace_tokens,
     scheduler_cache_group_pages,
+    scheduler_pd_lifecycle,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
@@ -326,17 +326,6 @@ class EventLoop:
             cache_groups=cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
-        scheduler_cfg.prefill_workspace_tokens = resolve_prefill_workspace_tokens(
-            disaggregation_mode=server_args.disaggregation_mode,
-            pp_size=mapping.pp_size,
-            speculative_algorithm=server_args.speculative_algorithm,
-            draft_model_type=(
-                draft_model_config.hf_config.model_type
-                if draft_model_config is not None
-                else None
-            ),
-            decode_input_tokens=decode_input_tokens,
-        )
         logger.info(
             "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
@@ -362,11 +351,16 @@ class EventLoop:
         # scheduler quantities (queue depth, page usage) that the loop already
         # samples, and its counters stay on this thread.
         self._batch_logger = BatchLogger(
-            # One TP representative for each attention-DP scheduler and PP
-            # stage makes load skew and stalled request lifecycles visible.
-            enabled=attn_tp_rank == 0,
+            # One TP representative per attention-DP scheduler makes load skew
+            # visible. Every pipeline stage runs the same scheduler and sees
+            # the same plan, so only the first stage speaks for it.
+            enabled=attn_tp_rank == 0 and (not mapping.has_pp or mapping.pp_rank == 0),
             dp_rank=dp_rank,
-            pp_rank=mapping.pp_rank,
+            pd_lifecycle=(
+                scheduler_pd_lifecycle(self.scheduler)
+                if server_args.disaggregation_mode != "null"
+                else None
+            ),
             decode_log_interval=server_args.decode_log_interval,
             # Usable pages, the same total the load snapshot and the
             # Prometheus gauge publish, so the three never disagree.
@@ -380,11 +374,9 @@ class EventLoop:
         self.max_model_len = min(
             self.model_config.context_len, self.max_single_request_tokens
         )
-        input_reserve = (
-            1
-            if server_args.disaggregation_mode == "prefill"
-            else max(decode_input_tokens, 1)
-        )
+        # Every role reserves the first decode/verify window behind the prompt:
+        # a decoding role to verify into it, the prefill role to draft into it.
+        input_reserve = max(decode_input_tokens, 1)
         self.max_req_input_len = self.max_model_len - input_reserve
         if self.max_req_input_len < 1:
             raise RuntimeError(
@@ -892,11 +884,6 @@ class EventLoop:
                 self._scheduler_cache_geometry.num_usable_pages - empty - active
             ),
             "num_queue_reqs": self.scheduler.waiting_size(),
-            "num_bootstrapping_reqs": self.scheduler.bootstrapping_size(),
-            "num_prefilling_reqs": self.scheduler.prefilling_size(),
-            "num_remote_prefilling_reqs": self.scheduler.remote_prefilling_size(),
-            "num_decoding_reqs": self.scheduler.decoding_size(),
-            "num_pd_transfer_reqs": self.scheduler.pd_transfer_size(),
         }
 
     def _record_scheduler_iteration_metrics(

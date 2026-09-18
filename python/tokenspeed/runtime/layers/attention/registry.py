@@ -32,7 +32,6 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4,
     is_qwen4_exp,
 )
-from tokenspeed.runtime.distributed.partition import target_execution_stage_windows
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
@@ -718,12 +717,12 @@ def _create_hybrid_linear_attn_backend(
     # non-spec hybrid decode doesn't get misclassified as target verify /
     # draft extend by `self.spec_num_tokens > 1`.
     if server_args.speculative_algorithm is not None:
-        if server_args.mapping.has_pp:
-            # PP only executes committed prefill state. A KDA backend starts
-            # allocating replay payloads in set_kv_pool, before explicit
-            # workspace preparation, so its verify width must already be one.
-            # Keep the original target/draft configs intact for logical cache
-            # geometry and other backend views.
+        if server_args.disaggregation_mode == "prefill":
+            # The prefill role only executes committed prefill state. A KDA
+            # backend starts allocating replay payloads in set_kv_pool, before
+            # explicit workspace preparation, so its verify width must already
+            # be one. Keep the original target/draft configs intact for
+            # logical cache geometry and other backend views.
             config = dataclasses.replace(config, speculative_num_draft_tokens=1)
         else:
             config.speculative_num_draft_tokens = (
@@ -749,7 +748,10 @@ def _create_hybrid_linear_attn_backend(
         if is_kda:
             kda_backend = _resolve_kda_backend(kda_backend)
             linear_attn_backend = KdaAttnBackend(
-                config, config.component(SoftmaxAttnConfig), kda_backend=kda_backend
+                config,
+                config.component(SoftmaxAttnConfig),
+                enable_prefill_graph=not server_args.disable_kda_prefill_graph,
+                kda_backend=kda_backend,
             )
         else:
             linear_attn_backend = MambaAttnBackend(
@@ -1125,10 +1127,12 @@ def create_attn_components(
     num_target_cache_layers = cache_setup.num_target_layers
     num_draft_cache_layers = cache_setup.num_draft_layers
     if server_args.mapping.has_pp:
+        from tokenspeed.runtime.distributed.pp_stage import pp_stage_windows
+
         # K3 and V4, the supported PP targets, have one cache layer per
         # execution block. Map their execution windows to the identical cache
         # IDs here; cache ownership itself does not partition execution blocks.
-        target_cache_windows = target_execution_stage_windows(
+        target_cache_windows = pp_stage_windows(
             model_config.num_hidden_layers,
             server_args.mapping.pp_size,
             server_args.mapping.pp_layer_partition,

@@ -51,9 +51,9 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillRese
             SnapshotStateReserveTokens(group.block_granularity, reserve.decode_input_tokens));
     }
     if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
-        return std::max(reserve.DecodeTokens(), reserve.workspace_tokens);
+        return reserve.DecodeTokens();
     }
-    return std::max({reserve.DecodeTokens(), reserve.prompt_headroom_tokens, reserve.workspace_tokens});
+    return std::max(reserve.DecodeTokens(), reserve.prompt_headroom_tokens);
 }
 
 }  // namespace
@@ -61,7 +61,7 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillRese
 void ReservePrefillDemands(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
                            const PrefillReserve& reserve) {
     _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
-    _assert(reserve.decode_input_tokens >= 0 && reserve.workspace_tokens >= 0 && reserve.prompt_headroom_tokens >= 0,
+    _assert(reserve.decode_input_tokens >= 0 && reserve.prompt_headroom_tokens >= 0,
             "prefill reserve inputs must be non-negative");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].reserve_tokens == 0, "a prefill demand's reserve is decided here and nowhere else");
@@ -88,14 +88,16 @@ void MakeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<co
             continue;
         }
         const std::int32_t block_granularity = coordinator.GroupBlockGranularity(static_cast<std::int32_t>(i));
-        demands[i].num_tokens = after_tokens;
         // A completing prefill may end off a prefix boundary. Materialize the
         // last completed checkpoint as well as the final continuation state:
         // the runtime writes both from this one model forward. Earlier slots
         // remain holes, preserving absolute block-table positions.
         const std::int32_t first_materialized_token =
             StateCheckpointMaterializationStart(before_tokens, after_tokens, coordinator.PrefixGranularity());
-        demands[i].materialized_suffix_start = (first_materialized_token - 1) / block_granularity;
+        demands[i].extent = SparseSuffix{
+            .extent_tokens = after_tokens,
+            .first_block = (first_materialized_token - 1) / block_granularity,
+        };
     }
 }
 
