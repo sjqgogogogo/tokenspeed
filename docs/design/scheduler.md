@@ -9,6 +9,22 @@ Companion documents: `event-loop.md` (the control/data plane split that
 consumes these plans), `cache-concepts.md` (the vocabulary below —
 prefix granularity, cache groups, LCM blocks).
 
+## Request-scoped prefix reads
+
+`RequestSpec.reuse_prefix_cache` controls cache reads independently of global
+cache enablement. The immutable request policy survives retraction. When false,
+`matchPrefixAtAdmission` probes an empty prefix for both device and host tiers,
+including recovery, and normal admission allocates private writable blocks.
+Cache publication, ownership, eviction, and transfers keep their existing rules;
+other requests may still read completed blocks published by this request.
+
+This policy expresses a recomputation requirement, not a logprob schema. The
+Python request boundary sets it for input-score collection; C++ does not inspect
+scoring flags or K. Do not fake cache identities, mutate the global cache switch,
+or truncate an already-claimed hit in Python. A global cache-off setting still
+retains its existing recovery exception for ordinary requests; request-scoped
+bypass is stricter and cannot take that exception.
+
 ## 1. Admission is per chunk
 
 A prompt is prefilled in chunks bounded by `max_scheduled_tokens`

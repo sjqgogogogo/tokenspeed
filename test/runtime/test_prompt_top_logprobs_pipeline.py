@@ -330,10 +330,6 @@ def test_invalid_topk_request_fails(start, count):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("enforce_eager", False),
-        ("disable_overlap_schedule", False),
-        ("enable_prefix_caching", True),
-        ("disable_kvstore", False),
         ("speculative_algorithm", "MTP"),
         ("pipeline_parallel_size", 2),
         ("disaggregation_mode", "decode"),
@@ -347,8 +343,6 @@ def test_diagnostic_configuration_is_explicit(field, value):
         ValueError, match="Top-K diagnostics currently require"
     ) as error:
         InputProcessor(engine)._validate_top_logprobs_request(_request(0, 2), 5)
-    if field == "enable_prefix_caching":
-        assert "--disable-prefix-caching" in str(error.value)
     assert InputProcessor(engine)._validate_top_logprobs_request(
         _request(-1, 0), 5
     ) == (-1, 0)
@@ -719,8 +713,8 @@ def test_sampled_input_without_topk_is_supported_and_gated():
     req = asyncio.run(InputProcessor(engine).tokenize_one_request(_request(0, 0)))
     assert (req.logprob_start_len, req.top_logprobs_num) == (0, 0)
     engine.server_args.enforce_eager = False
-    with pytest.raises(ValueError, match="enforce-eager"):
-        asyncio.run(InputProcessor(engine).tokenize_one_request(_request(0, 0)))
+    req = asyncio.run(InputProcessor(engine).tokenize_one_request(_request(0, 0)))
+    assert (req.logprob_start_len, req.top_logprobs_num) == (0, 0)
 
 
 @pytest.mark.parametrize("stream", [False])
@@ -823,12 +817,6 @@ def test_explicit_cuda_decode_graph_mode_permits_diagnostics(start, k):
     [
         ("device", "npu"),
         ("device", "cpu"),
-        ("enforce_eager", True),
-        ("disable_prefill_graph", False),
-        ("disable_prefill_graph", None),
-        ("disable_overlap_schedule", False),
-        ("enable_prefix_caching", True),
-        ("disable_kvstore", False),
         ("dp_sampling", True),
     ],
 )
@@ -840,10 +828,140 @@ def test_graph_opt_in_preserves_other_gates_and_cannot_silently_fall_back(field,
     setattr(engine.server_args, field, value)
     with pytest.raises(ValueError) as error:
         asyncio.run(InputProcessor(engine).tokenize_one_request(_request(0, 2)))
-    if field == "enable_prefix_caching":
-        assert "--disable-prefix-caching" in str(error.value)
     ordinary = _request(-1, 0)
     ordinary.return_logprob = False
     assert not asyncio.run(
         InputProcessor(engine).tokenize_one_request(ordinary)
     ).return_logprob
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("start,k", [(0, 0), (0, 3), (2, 3), (-1, 3)])
+def test_diagnostics_keep_overlap_prefill_graph_and_both_cache_tiers(eager, start, k):
+    engine = _engine()
+    engine.server_args.enforce_eager = eager
+    engine.server_args.enable_logprob_graph = False
+    engine.server_args.disable_prefill_graph = False
+    engine.server_args.disable_overlap_schedule = False
+    engine.server_args.enable_prefix_caching = True
+    engine.server_args.disable_kvstore = False
+    req = asyncio.run(InputProcessor(engine).tokenize_one_request(_request(start, k)))
+    assert (req.logprob_start_len, req.top_logprobs_num) == (start, k)
+    assert engine.server_args.enable_prefix_caching
+    assert not engine.server_args.disable_overlap_schedule
+
+
+@pytest.mark.parametrize(
+    "return_logprob,start,reuse",
+    [(False, -1, True), (True, -1, True), (True, 0, False), (True, 2, False)],
+)
+def test_request_admission_bypasses_cache_only_for_input_scores(
+    return_logprob, start, reuse
+):
+    path = ENGINE / "request_handler.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "RequestHandler"
+    )
+    method = next(
+        n for n in cls.body if getattr(n, "name", None) == "handle_generate_request"
+    )
+    method.decorator_list = []
+    state = SimpleNamespace(
+        return_logprob=return_logprob,
+        logprob_start_len=start,
+        sampling_params=SimpleNamespace(max_new_tokens=4),
+        prompt_input_ids=[1, 2, 3],
+    )
+    ns = {
+        "make_spec": lambda **kw: SimpleNamespace(**kw),
+        "RequestState": SimpleNamespace(from_recv_req=lambda *a, **kw: state),
+        "BootstrapInfo": lambda *a: a,
+    }
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            method,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+    handler = SimpleNamespace(
+        server_args=SimpleNamespace(disaggregation_bootstrap_port=0),
+        tokenizer=None,
+        hf_eos_token_id=None,
+        max_req_len=100,
+    )
+    req = SimpleNamespace(
+        rid="r",
+        input_ids=[1, 2, 3],
+        bootstrap_port=None,
+        bootstrap_host=None,
+        bootstrap_room=None,
+        session_params=None,
+    )
+    spec, _, _ = ns["handle_generate_request"](handler, req)
+    assert spec.reuse_prefix_cache is reuse
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        None,
+        "spec",
+        "pd",
+        "pp",
+        "attn_dp",
+        "attn_cp",
+        "dense_dp",
+        "dp_sampling",
+        "multimodal",
+    ],
+)
+def test_graph_capture_is_automatic_only_for_supported_logprob_execution(unsupported):
+    args = _engine().server_args
+    args.mapping.pp_size = 1
+    model = SimpleNamespace(is_multimodal=False)
+    if unsupported == "spec":
+        args.speculative_algorithm = "MTP"
+    elif unsupported == "pd":
+        args.disaggregation_mode = "decode"
+    elif unsupported == "pp":
+        args.mapping.pp_size = 2
+    elif unsupported in ("attn_dp", "attn_cp"):
+        setattr(
+            args.mapping.attn, "dp_size" if unsupported == "attn_dp" else "cp_size", 2
+        )
+    elif unsupported == "dense_dp":
+        args.mapping.dense.has_dp = True
+    elif unsupported == "dp_sampling":
+        args.dp_sampling = True
+    elif unsupported == "multimodal":
+        model.is_multimodal = True
+    path = ENGINE.parent / "execution/model_executor.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "ModelExecutorConfig"
+    )
+    factory = next(
+        n for n in cls.body if getattr(n, "name", None) == "from_server_args"
+    )
+    call = next(
+        n
+        for n in ast.walk(factory)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "ModelExecutorConfig"
+    )
+    value = next(k.value for k in call.keywords if k.arg == "enable_logprob_graph")
+    enabled = eval(
+        compile(ast.Expression(value), str(path), "eval"),
+        {"server_args": args, "model_config": model},
+    )
+    assert enabled is (unsupported is None)

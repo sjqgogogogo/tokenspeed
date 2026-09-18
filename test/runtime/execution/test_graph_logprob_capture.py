@@ -25,7 +25,7 @@ import ast
 import importlib.util
 import sys
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -147,6 +147,7 @@ def make_runner(use_graph):
         _verify_graph_metadata=lambda key: events.append(("pointer_guard", key)),
         diagnostic_graph_replays=0,
         global_rank=2,
+        overlap_schedule_depth=1,
         max_tokens_per_req=1,
         _forward_func=eager,
         drafter=None,
@@ -197,7 +198,7 @@ class GraphLogprobTests(unittest.TestCase):
         self.assertTrue(torch.equal(capture.output_values[:, 0], expected.values))
         self.assertTrue(torch.equal(capture.output_indices[:, 0], expected.indices))
         self.assertEqual(runner.diagnostic_graph_replays, 1)
-        self.assertEqual(logs[0][1:], (2, 1, 3, 4, "default", True))
+        self.assertEqual(logs[0][1:], (2, 1, 3, 4, "default", True, 1))
 
     def test_live_k_batch_switch_and_normal_request_do_not_reuse_results(self):
         call, runner, events, logs, original = make_runner(True)
@@ -233,11 +234,11 @@ class GraphLogprobTests(unittest.TestCase):
         self.assertIn("ordinary_replay", events)
         self.assertEqual(runner.diagnostic_graph_replays, 1)
         self.assertTrue(torch.all(runner._diagnostic_logits == 123))
-        self.assertEqual(logs[0][-1], False)
+        self.assertEqual(logs[0][-2], False)
+        self.assertEqual(logs[0][-1], 1)
 
     def test_missing_graph_or_disabled_flag_cannot_silently_eager_fallback(self):
         for available, enabled, captured in (
-            (False, True, True),
             (True, False, True),
             (True, True, False),
         ):
@@ -251,6 +252,39 @@ class GraphLogprobTests(unittest.TestCase):
                 run(call, runner, context(1, capture_for((2,)), True, True))
             self.assertNotIn("eager", events)
             self.assertNotIn("diagnostic_replay", events)
+
+    def test_diagnostic_above_ladder_keeps_same_eager_route(self):
+        call, runner, events, logs, original = make_runner(False)
+        capture = capture_for((2, 1))
+        expected = torch.log_softmax(original[:2].clone(), -1).topk(2, -1)
+        run(call, runner, context(2, capture, True, True))
+        self.assertIn(("refresh", 2, 2, False), events)
+        self.assertIn("eager", events)
+        self.assertTrue(torch.equal(capture.output_values[:, 0], expected.values))
+        self.assertEqual(runner.diagnostic_graph_replays, 0)
+
+    def test_queued_results_survive_later_replays_before_cpu_consumption(self):
+        call, runner, events, logs, original = make_runner(True)
+        pending = []
+        expected = []
+        for shift in (0, 3, 1):
+            logits = torch.arange(28, dtype=torch.float32).reshape(4, 7).roll(shift, -1)
+            original.copy_(logits)
+            capture = capture_for((3, 1, 2))
+            run(call, runner, context(3, capture, True, True))
+            pending.append(capture.copy_to_cpu())
+            expected.append(torch.log_softmax(logits[:3], -1).topk(3, -1))
+        # The control plane consumes these only after all three forwards have
+        # reused the shared graph snapshot. Each result must own its data.
+        for result, ref in zip(pending, expected):
+            self.assertTrue(
+                torch.equal(result["output_top_logprobs_val"][:, 0], ref.values)
+            )
+            self.assertTrue(
+                torch.equal(result["output_top_logprobs_idx"][:, 0], ref.indices)
+            )
+        self.assertEqual(events.count("diagnostic_replay"), 3)
+        self.assertNotIn("eager", events)
 
     def test_ordinary_above_ladder_keeps_existing_eager_route(self):
         call, runner, events, logs, original = make_runner(False)
@@ -324,6 +358,81 @@ class GraphLogprobTests(unittest.TestCase):
             )
         )
         self.assertTrue(torch.all(logits == -99))
+
+    def test_prefill_graph_replay_keeps_prompt_scores_in_the_logits_tail(self):
+        nodes = [
+            COMMON.method(RUNTIME / "execution/prefill_graph.py", "PrefillGraph", name)
+            for name in ("replay", "_padded_to")
+        ]
+        module = COMMON.exec_nodes(
+            nodes,
+            "_prefill_logprob_cpu_replay",
+            {
+                "torch": torch,
+                "contextmanager": contextmanager,
+                "active_forward": lambda ctx: nullcontext(),
+                "LogitsMetadata": COMMON.LOGITS.LogitsMetadata,
+            },
+        )
+        hidden = torch.arange(28, dtype=torch.float32).reshape(4, 7)
+        capture = HELPER.TopLogprobCapture((Config(True, 0, 2, (1, 2, 0)),), 1, (3,), 7)
+        ctx = SimpleNamespace(
+            input_num_tokens=3,
+            global_num_tokens=None,
+            global_bs=1,
+            top_logprob_capture=capture,
+            forward_mode=SimpleNamespace(is_extend_or_mixed=lambda: True),
+            gather_ids=torch.tensor([2]),
+            capture_hidden_mode=COMMON.CaptureMode.NULL,
+        )
+        events = []
+        processor = COMMON.make_processor(COMMON.LOGITS)
+
+        def logits_tail(ids, states, head, metadata, aux):
+            events.append("logits")
+            self.assertEqual(ctx.input_num_tokens, 3)
+            self.assertEqual(tuple(states.shape), (3, 7))
+            return processor.forward(ids, states, head, metadata, aux)
+
+        runner = SimpleNamespace(
+            _replay_bucket=lambda ctx: 4,
+            _log_engaged_once=lambda *args: None,
+            _land_input_embeds=lambda *args: events.append("embed"),
+            _embed_tokens=lambda ids: ids,
+            input_buffers=SimpleNamespace(
+                input_ids_buf=torch.ones(4, dtype=torch.int32),
+                positions_buf=torch.arange(4),
+            ),
+            config=SimpleNamespace(model_is_mrope=False, world_size=1),
+            dp_size=1,
+            _captures={
+                4: SimpleNamespace(
+                    replay=lambda **kw: events.append(
+                        ("graph", ctx.input_num_tokens, kw["valid_rows"])
+                    )
+                )
+            },
+            _outputs={4: SimpleNamespace(sliced=lambda n: (hidden[:n], None))},
+            text_model=SimpleNamespace(
+                logits_processor=logits_tail, lm_head=torch.eye(7)
+            ),
+        )
+        runner._padded_to = lambda ctx, bucket: contextmanager(module._padded_to)(
+            runner, ctx, bucket
+        )
+        result = module.replay(runner, ctx, torch.tensor([0, 1, 2]), None)
+        capture.capture(result)
+        self.assertEqual(events, ["embed", ("graph", 4, 3), "logits"])
+        expected = torch.log_softmax(hidden[:3], -1)
+        self.assertTrue(
+            torch.equal(
+                capture.input_token_values[0],
+                expected[torch.arange(3), torch.tensor([1, 2, 0])],
+            )
+        )
+        self.assertTrue(
+            torch.equal(capture.input_values[0], expected.topk(2, -1).values)
+        )
 
     def test_capture_assets_are_separate_and_config_flag_is_explicit(self):
         method = COMMON.method(

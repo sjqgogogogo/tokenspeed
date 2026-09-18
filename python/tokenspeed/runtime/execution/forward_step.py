@@ -291,21 +291,16 @@ class ForwardStepRunner:
         self.diagnostic_output_buffers: dict[tuple[str, int], tuple] = {}
         self.diagnostic_graph_replays = 0
         self._diagnostic_logits = None
-        if config.enable_logprob_graph:
-            if (
-                self.device != "cuda"
-                or self.disable
-                or self.max_tokens_per_req != 1
-                or self.dp_size != 1
-                or config.pp_size != 1
-                or config.overlap_schedule_depth != 0
-                or config.dp_sampling
-                or not config.disable_prefill_graph
-            ):
-                raise ValueError(
-                    "Logprob graphs require CUDA decode graphs, no overlap/spec/DP/PP, "
-                    "and --disable-prefill-graph"
-                )
+        if (
+            config.enable_logprob_graph
+            and not self.disable
+            and self.device == "cuda"
+            and self.max_tokens_per_req == 1
+            and config.spec_algo is None
+            and self.dp_size == 1
+            and config.pp_size == 1
+            and not config.dp_sampling
+        ):
             # Allocated outside every graph pool; all ladder/variant views share
             # this one address-stable backing allocation. Only diagnostic graphs
             # record a copy to it. Dynamic K work runs after replay.
@@ -950,11 +945,8 @@ class ForwardStepRunner:
         """
         use_graph = self._can_use_graph(bs, ctx)
         diagnostic = ctx.logprob_diagnostic and self.config.enable_logprob_graph
-        if diagnostic and ctx.forward_mode.is_decode() and not use_graph:
-            raise RuntimeError(
-                "Diagnostic decode requires actual CUDA graph replay; "
-                "batch size is outside the available capture ladder"
-            )
+        # Preserve the ordinary graph eligibility rules, including eager
+        # batches above the ladder. Diagnostics never drain the overlap queue.
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
@@ -1040,7 +1032,7 @@ class ForwardStepRunner:
             graph_key = self._cuda_graph_key(padded_bs)
             needs_snapshot = ctx.top_logprob_capture is not None
             if needs_snapshot and not diagnostic:
-                raise RuntimeError("Graph Top-K requires --enable-logprob-graph")
+                raise RuntimeError("Graph Top-K requires logprob capture buffers")
             graphs = self.diagnostic_graphs if needs_snapshot else self.graphs
             buffers = (
                 self.diagnostic_output_buffers
@@ -1071,13 +1063,14 @@ class ForwardStepRunner:
                 if self._graph_debug:
                     logger.info(
                         "LOGPROB_GRAPH_REPLAY rank=%s count=%s live_bs=%s padded_bs=%s "
-                        "variant=%s snapshot=%s",
+                        "variant=%s snapshot=%s overlap_depth=%s",
                         self.global_rank,
                         self.diagnostic_graph_replays,
                         bs,
                         padded_bs,
                         graph_key[0],
                         needs_snapshot,
+                        self.overlap_schedule_depth,
                     )
 
             (

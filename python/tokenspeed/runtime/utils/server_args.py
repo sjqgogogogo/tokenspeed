@@ -289,7 +289,8 @@ class ServerArgs:
     # Opt-in prompt Top-K diagnostics; not an export of full-vocabulary logits.
     # Requests also require enable_output_logprobs.
     enable_input_logprobs: bool = False
-    # Experimental diagnostic decode graphs; prompt scoring remains eager.
+    # Compatibility opt-in; enable_output_logprobs also prepares supported
+    # decode graph snapshots. Prefill graphs retain their eager logits tail.
     enable_logprob_graph: bool = False
 
     # Runtime options
@@ -1827,9 +1828,8 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_logprob_graph,
             help=(
-                "Enable experimental CUDA Graph decode for logprob diagnostics. "
-                "Requires CUDA and --disable-prefill-graph; do not combine with "
-                "--enforce-eager. All other diagnostic restrictions still apply."
+                "Enable CUDA decode logprob snapshots (also enabled by "
+                "--enable-output-logprobs). Does not disable overlap or prefill graphs."
             ),
         )
         parser.add_argument(

@@ -377,45 +377,30 @@ executor's two-copy path (`get_packed_output_d2h` returns None).
 
 ## What stays graph-only
 
-### Opt-in raw-logprob graph observation
+### Raw-logprob graph observation
 
-`--enable-logprob-graph` adds observation assets, not another model or
-metadata path. Each sampler variant and captured batch size keeps its original
-graph and gains a diagnostic copy of the same `_forward_step`. Only that copy
-attaches `RawLogitsSnapshot` to its capture-time `ForwardContext`: after the
-existing NaN audit and before sampling can modify logits, it records a copy
-to a persistent FP32 `[max_capture_bs, vocab_size]` allocation made outside
-all graph pools. All captured sizes use views into this one allocation.
-The original graphs record no copy; ordinary requests continue to select them.
+Output-logprob enablement prepares diagnostic decode assets for supported
+non-speculative, monolithic CUDA execution. Ordinary requests keep their original
+graph; diagnostic Top-K requests select a capture of the same `_forward_step`
+with a pre-sampling raw-logit snapshot. This is a capture parameter, never a
+second metadata, attention, sampling, or scheduler path.
 
-Replay uses the same live table delivery, refresh, padding and state-write
-rules. After actual `graph.replay()`, the forward-local diagnostic collector
-reads only `[:live_bs]` on the same execution stream and computes the requested
-dynamic Top-K. Neither K nor request objects are frozen into the graph.
-The graph still returns exactly the original three sampled-output tensors.
-All diagnostic D2H copies precede the existing result event; the event loop
-still consumes them only through `PendingExecution.result()`.
+The snapshot lives outside graph pools. The forward thread replays, computes
+live-row Top-K, and enqueues owned D2H results on the existing execution stream
+before it starts the next forward. The result's copy event covers these copies;
+`PendingExecution.result()` is still the only commit fence. Overlap introduces
+no extra drain or global synchronize. CPU consumers never retain a view of the
+persistent snapshot. Input-only K=0 decode uses the original graph.
 
-Input-only K=0 diagnostics do not need a raw snapshot during decode and select
-the original graph. Both forms increment `diagnostic_graph_replays`; when
-`TOKENSPEED_GRAPH_DEBUG=1`, they also emit `LOGPROB_GRAPH_REPLAY` after
-replay is issued. Validation must explicitly enable this existing debug
-switch to collect per-rank replay evidence. Normal requests do neither.
-The log is issuance evidence, not a separate GPU completion fence; a successful
-response also requires the existing result fence and commit. Diagnostic
-decode outside the captured ladder fails closed rather than silently running
-eager. Prompt/chunk forwards remain eager, with `--disable-prefill-graph`
-required explicitly. No overlap, speculation, prefix reuse, KV-store reuse,
-PP, attention/dense DP/CP or disaggregated serving is admitted by this
-diagnostic capability. Prompt/Top-K requests must also be non-streaming;
-the request gate rejects `stream=True` before scheduling. The existing
-collector and ordinary sampled-output-only streaming contract are unchanged.
+Prefill graph already ends in the model's eager logits tail. The same
+`LogitsMetadata.from_forward_context` passes the forward-local diagnostic controls
+through that tail; prompt scoring does not require disabling prefill graph.
+Above-ladder batches retain the ordinary eager route; an eligible diagnostic
+replay with missing capture assets fails rather than changing execution mode.
+`TOKENSPEED_GRAPH_DEBUG=1` reports replay and configured overlap depth. Actual
+GPU correctness and overlap must be verified independently of CPU mock tests.
 
-CPU tests execute the actual runner and capture methods with mocked graph
-objects, covering padded live rows, mixed K, normal/diagnostic switching,
-capture-only snapshot attachment and the unchanged tuple3 ABI. This does not
-validate CUDA graph allocation lifetimes, kernel capture or real replay;
-those require the eager-versus-graph GPU regression.
+Scope and numerical conventions are in `prompt-logprob-diagnostics.md`.
 
 Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
 of replaying a recorded graph: input-buffer padding to the ladder bs plus the

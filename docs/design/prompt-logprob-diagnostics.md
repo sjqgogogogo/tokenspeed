@@ -35,14 +35,11 @@ Top-K 与 input 实际 token 分数来自模型 logits 的 FP32 log-softmax，�
 
 新 `--enable-input-logprobs` 默认关闭；仅启用 output 不会隐式开启 input。现有 `--enable-output-logprobs` 不是“导出全部 logits”开关，原本只驱动实际生成 token 的 logprob 计算。本扩展仍要求该开关，以复用既有采样分数路径。
 
-eager 诊断请求的验收配置：
+保留服务原本的 CUDA Graph、overlap schedule、prefill graph 和 prefix cache 配置。非 MTP、非 PD 单体服务在开启 output logprobs 时自动准备可支持的 decode graph 快照；`--enable-logprob-graph` 保留为兼容开关，不再是必需参数。
 
-```bash
---enforce-eager --disable-overlap-schedule \
---disable-prefix-caching --disable-kvstore
-```
+请求 input logprobs（`return_logprob=True, logprob_start_len>=0`）时，Python 请求入口设置 C++ `RequestSpec.reuse_prefix_cache=False`。scheduler 在每次 admission（包括 retraction 后重入）绕过 L1/L2 前缀读取，为重新计算分配私有可写块；完成块仍按原规则发布缓存，其他请求可继续命中。只请求 output 分数/top-K 的请求继续正常复用缓存。需重新编译安装 `tokenspeed-scheduler`，仅更新 Python 源码不足以加入这个字段。
 
-此外要求 `stream=False`、单体服务、无 speculative decoding、PP=1、Attention DP/CP=1、Dense DP 关闭、`dp_sampling=False`、非多模态输入。TP 可保留。无诊断请求的普通生成及原有 sampled-output-only 请求（`start=-1,K=0`，包括 stream）不受新增 gate 限制。本页的 CPU/eager 回归不证明 CUDA Graph / overlap 支持；相关 gate、图重放证据和逐项数值验收需要独立核验。
+本期仍要求 `stream=False`、单体服务、无 MTP/speculative decoding、PP=1、Attention DP/CP=1、Dense DP 关闭、`dp_sampling=False`、非多模态输入。TP 可保留。普通生成和原有 sampled-output-only 请求（`start=-1,K=0`，包括 stream）保留原有支持范围，不会因为诊断扩展缩小范围。GPU 数值与实际并行行为仍需验收，CPU 测试不能替代它们。
 
 ## 直接使用 Python 引擎
 
@@ -55,7 +52,7 @@ Engine.generate(..., stream=False)
   → 现有非流式 collector
 ```
 
-在既有模型、TP 和后端配置上设置 Python 参数 `enable_input_logprobs=True`、`enable_output_logprobs=True`、`enforce_eager=True`、`disable_overlap_schedule=True`、`enable_prefix_caching=False`、`disable_kvstore=True`，其他限制见上节。随后调用已创建的 `engine`：
+在既有模型、TP 和后端配置上设置 Python 参数 `enable_input_logprobs=True`、`enable_output_logprobs=True`，保留 CUDA Graph、overlap 和缓存设置，其他范围限制见上节。随后调用已创建的 `engine`：
 
 ```python
 # input_ids 是已核实的原始整数 token IDs，不对文本重复编码。
@@ -119,7 +116,7 @@ HTTP 请求继续走 SMG，不增加 Chat/Completion 扩展。部署时需要成
 
 示例 token IDs 必须替换为模型 tokenizer 对应的真实输入。CI 应使用返回的整数 `output_ids` 拼接原始 `input_ids`，再执行 full-prefill；不能把生成文本重新分词作为对齐依据。SMG 原有 chosen-token 返回项为 `[logprob, token_id]`，新增 top-K 项带空 text 槽 `[logprob, token_id, null]`；比较程序读取前两个槽即可。首 prompt token 的 chosen 分数和候选分布均为空，实际零分数则保留为数值零。`K=0` 时不制造 top-K 分数。
 
-本次诊断支持并发请求，但不解除 prefix-cache、overlap 等诊断限制。串行、每次 flush 的 bitwise 回归，以及较高并发的容差比较，仍由外层测试编排控制。真实 GPU 上的 bitwise 稳定性和 prefill/decode 数值容差必须单独验收。
+本次诊断支持并发、overlap、graph 和全局 prefix cache；input 分数请求的缓存绕过在 scheduler 中按请求执行。串行、每次 flush 的 bitwise 回归，以及较高并发的容差比较，仍由外层测试编排控制。真实 GPU 上的 bitwise 稳定性和 prefill/decode 数值容差必须单独验收。
 
 ## CPU 回归与 GPU 验收边界
 
@@ -142,10 +139,17 @@ GPU 下一步必须核实：
 2. 输入超过 chunk 大小，确认完整 N 项和 output 第 0 项不重不漏。
 3. 固定输入/seed，比较 diagnostic off/on 的实际输出及浮点差异；input 模式把 LM head 从末行选择扩为全 chunk，矩阵形状变化可能影响低精度舍入，不能只凭 CPU 测试宣称生成 bitwise 不变。
 4. 检查 GPU 显存：完整 chunk × vocab logits / FP32 log-softmax 的峰值高于 sampled-output-only；从短输入小 chunk 开始，不直接投入长上下文高并发。
-5. eager 成功后才在独立副本测试 CUDA Graph；不能把本轮限制静默取消。
+5. 全局 cache 开启时，普通重复请求命中、input 分数请求不命中；混合 batch、L2、可控 retraction 下验证两者仍独立。
+6. 在 graph 和 overlap 开启的部署上验证实际 replay 与在途请求行为；batch 超出捕获阶梯时保留引擎正常 eager 路由，报告真实执行路径。
 
-## 显式 CUDA Graph 诊断
+## CUDA Graph 与 overlap 的数据所有权
 
-保留两项 logprob 开关和上述隔离条件，以 `--enable-logprob-graph --disable-prefill-graph` 替代 `--enforce-eager`。Prefill/chunk 仍走 eager；decode 使用原统一 refresh 和 sampler 路径。普通请求保留无快照的原 graph，诊断 Top-K graph 将原始 logits 拷入图池外的持久 FP32 buffer，再在 replay 后按 live batch 与每请求 K 收集。超出 capture ladder 或缺少诊断 graph 时明确失败。
+Prefill 沿原 breakable graph 重放模型主体，随后在现有 eager logits tail 采集 prompt 分数；不会为 input logprobs 禁用 prefill graph。Decode 的每个 sampler/batch-size graph 保留普通版本，并用同一个 `_forward_step` 捕获带原始 logits 快照的版本。快照在采样修改 logits 前写入图池外的持久 FP32 buffer；graph 后按 live batch/每请求 K 取分数，padding 行不返回。
 
-每次诊断 decode replay 累计计数；验收启动必须显式设置 `TOKENSPEED_GRAPH_DEBUG=1`，才会发出 `LOGPROB_GRAPH_REPLAY`（rank/count/live_bs/padded_bs/variant/snapshot）。日志证明已发起 replay，不代替完成 fence 和成功响应；默认不逐步打印日志。验收需包含异构 K、普通/诊断交替、live BS1/2/3 pad4/4、跨 chunk、EOS 和 slot 复用。CPU mocked-graph 测试不证明 CUDA 数值或生命周期正确，GPU eager/graph 同输入对照必须独立执行。这是诊断功能，不用于公平吞吐基准。
+执行线程在同一 execution stream 上按 FIFO 提交：本轮 graph → 本轮 top-K 结果 → D2H → copy_event → 后续 forward。配置由 `PlannedForward` 捕获，分数在每轮创建的 `ModelExecutionResult` 中独立持有。控制线程只在原有 commit 边界通过 `PendingExecution.result()` 等待；不新增 GPU 同步、不为了诊断排空 overlap 队列。不要把静态 graph 缓冲直接交给异步 CPU 消费者。
+
+原本符合 graph 条件的诊断请求必须实际 replay；缺少应有的诊断 graph 是错误。引擎原本不使用 graph 的形状（例如超过捕获阶梯）继续走相同 forward 的 eager 路由。`TOKENSPEED_GRAPH_DEBUG=1` 时 `LOGPROB_GRAPH_REPLAY` 记录 rank/count/live_bs/padded_bs/variant/snapshot/overlap_depth；depth 是配置，不单独证明实际在途深度，需结合调度 trace 或 profiler 验证 overlap。
+
+新增的 `test/runtime/execution/test_logprob_overlap_cuda.py` 用真实 CUDA graph 连续重放和延迟 CPU 消费验证缓冲区生命周期（无模型下载）；无 CUDA 的机器会跳过。它不替代真实模型、attention、scheduler 和 HTTP 的端到端验收。诊断有额外计算/传输开销，不用于无诊断吞吐基准。
+
+MTP 仅作可行性研究，仍拒绝新增 prompt/top-K 诊断请求，见 [后续 speculative logprobs](speculative-logprobs.md)。

@@ -31,6 +31,9 @@ struct RequestSpec {
     std::string request_id;
     std::vector<std::int32_t> tokens;
     std::int32_t max_new_tokens{0};
+    // Read policy only: bypass both cache tiers on every admission, including
+    // retraction recovery. Computed blocks still follow normal publication.
+    bool reuse_prefix_cache{true};
 };
 
 // One prefill chunk's model inputs. The input covers `extend_len` tokens

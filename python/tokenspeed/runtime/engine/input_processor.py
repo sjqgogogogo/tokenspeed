@@ -99,23 +99,8 @@ class InputProcessor:
 
         args = self.engine.server_args
         failures = []
-        if args.enable_logprob_graph:
-            if args.enforce_eager:
-                failures.append(
-                    "omit --enforce-eager when --enable-logprob-graph is set"
-                )
-            if args.device != "cuda":
-                failures.append("device='cuda' for diagnostic CUDA Graph")
-            if args.disable_prefill_graph is not True:
-                failures.append("--disable-prefill-graph for eager prompt diagnostics")
-        elif not args.enforce_eager:
-            failures.append("--enforce-eager or opt-in --enable-logprob-graph")
-        if not args.disable_overlap_schedule:
-            failures.append("--disable-overlap-schedule")
-        if args.enable_prefix_caching:
-            failures.append("--disable-prefix-caching")
-        if not args.disable_kvstore:
-            failures.append("--disable-kvstore")
+        if not args.enforce_eager and args.device != "cuda":
+            failures.append("device='cuda' for graph logprob diagnostics")
         if args.speculative_algorithm is not None:
             failures.append("no speculative decoding")
         if args.pipeline_parallel_size != 1:

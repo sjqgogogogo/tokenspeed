@@ -1983,6 +1983,33 @@ TEST_F(FusedRetractionL2TestSuite, RetractionStoresTheLatestCompletedBoundary) {
         << "fused retraction must store the completed boundary before releasing request ownership";
 }
 
+TEST_F(FusedRetractionL2TestSuite, RequestCacheReadPolicySurvivesRetractionWithHostSnapshot) {
+    RequestSpec bypass = MakeRequestSpec("r1", 2);
+    bypass.reuse_prefix_cache = false;
+    Submit(bypass);
+    Submit(MakeRequestSpec("r2", 2, 101));
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {144});
+    CompleteStores(PlanOnce());
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+    ASSERT_GT(scheduler_->HostPoolCachedBlocks(), 0);
+    SendAbortEvent("r2");
+    const ExecutionPlan readmit = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(readmit).empty());
+    const ForwardBatch* op = FindForwardBatch(readmit);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(op->extend_prefix_lens[0], 0);
+    EXPECT_EQ(op->input_lengths[0], 7);
+}
+
 TEST_F(FusedRetractionL2TestSuite, AReadmissionThatDoesNotFitWaitsWithoutRetracting) {
     // Drive r1 into Retracted with an L2 snapshot while r2 keeps decoding.
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
@@ -3614,6 +3641,97 @@ TEST_F(PrefixHitSuite, FinishPublishesPagesFromLastForward) {
     ASSERT_EQ(second->request_ids.size(), 1u);
     EXPECT_EQ(second->input_lengths.at(0), 2);
     EXPECT_EQ(second->extend_prefix_lens.at(0), 6);
+}
+
+TEST_F(KimiFourGroupSuite, RequestCacheReadPolicyBypassesStateCheckpoints) {
+    const RequestSpec warm = MakeRequestSpec("warm", 3);
+    Submit(warm);
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("warm", {9001});
+    SendFinish("warm");
+    PlanOnce();
+    const auto tokens = MakeRequestSpec("unused", 4).tokens;
+    Submit({RequestSpec{.request_id = "cached", .tokens = tokens},
+            RequestSpec{.request_id = "bypass", .tokens = tokens, .reuse_prefix_cache = false}});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 2u);
+    for (std::size_t i = 0; i < op->request_ids.size(); ++i) {
+        EXPECT_EQ(op->extend_prefix_lens[i], op->request_ids[i] == "cached" ? 6 : 0);
+    }
+    for (const auto& [group, rows] : op->block_tables) {
+        std::set<std::int32_t> seen;
+        CollectDisjointRealPages(rows, seen, group);
+    }
+}
+
+TEST_F(PrefixHitSuite, RequestCacheReadPolicyKeepsOtherRequestsHot) {
+    const RequestSpec first = MakeRequestSpec("warm", 4);
+    RunLifecycle(first);
+    RequestSpec bypass{.request_id = "bypass", .tokens = first.tokens, .reuse_prefix_cache = false};
+    Submit({RequestSpec{.request_id = "cached", .tokens = first.tokens}, bypass});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 2u);
+    for (std::size_t i = 0; i < op->request_ids.size(); ++i) {
+        const bool cached = op->request_ids[i] == "cached";
+        EXPECT_EQ(op->extend_prefix_lens[i], cached ? 6 : 0);
+        EXPECT_EQ(op->input_lengths[i], cached ? 2 : 8);
+    }
+    // The uncached request must write private pages, never the other request's KV.
+    for (const auto& [group, rows] : op->block_tables) {
+        std::set<std::int32_t> seen;
+        CollectDisjointRealPages(rows, seen, group);
+    }
+}
+
+TEST_F(PrefixHitSuite, RequestCacheBypassStillPublishesCompletedBlocks) {
+    RequestSpec first = MakeRequestSpec("bypass", 4);
+    first.reuse_prefix_cache = false;
+    RunLifecycle(first);
+    Submit(RequestSpec{.request_id = "cached", .tokens = first.tokens});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->extend_prefix_lens.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens[0], 6);
+}
+
+class RequestCacheReadL2Suite : public PrefixHitSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefixHitSuite::MakeConfig();
+        cfg.disable_l2_cache = false;
+        return cfg;
+    }
+};
+
+TEST_F(RequestCacheReadL2Suite, BypassDoesNotLoadHostPrefix) {
+    const RequestSpec first = MakeRequestSpec("warm", 4);
+    Submit(first);
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("warm", {9001});
+    SendFinish("warm");
+    AckWriteBacks(PlanOnce());
+    AckWriteBacks(PlanOnce());
+    ASSERT_GT(scheduler_->HostPoolCachedBlocks(), 0);
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    Submit(RequestSpec{.request_id = "bypass", .tokens = first.tokens, .reuse_prefix_cache = false});
+    const ExecutionPlan cold = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(cold).empty());
+    const ForwardBatch* op = FindForwardBatch(cold);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->extend_prefix_lens.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens[0], 0);
+    EXPECT_EQ(op->input_lengths[0], 8);
+    SendForwardDone("bypass", {9002});
+    SendAbortEvent("bypass");
+    PlanOnce();
+    Submit(RequestSpec{.request_id = "cached", .tokens = first.tokens});
+    const ExecutionPlan hot = PlanOnce();
+    EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(hot).empty());
 }
 
 TEST_F(PrefixHitSuite, ClearL1CacheRemovesAnIdlePrefix) {
