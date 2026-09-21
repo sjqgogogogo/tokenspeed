@@ -25,7 +25,8 @@ CUDA_VARIANT=cu129 bash test/ci_system/install_deps.sh
 Set `CUDA_HOME` to the CUDA 12.9 toolkit location when it is installed
 elsewhere. Before installing packages, the helper checks Linux, Python 3.11,
 an active virtual environment, and the version reported by
-`$CUDA_HOME/bin/nvcc`. That compiler is also selected explicitly for the
+`$CUDA_HOME/bin/nvcc` and `$CUDA_HOME/bin/ptxas`. Both must report CUDA 12.9.
+The nvcc compiler is also selected explicitly for the
 in-tree kernel build. The host supplies its C++ compiler, OpenSSL development
 files, and required runtime libraries. The recipe does not run apt or sudo.
 Each pip call uses the active Python interpreter; proxy environment variables
@@ -69,6 +70,24 @@ redirect pip outside the active venv are cleared for the installer process.
 The normal checkout pins remain authoritative, including the updated
 `tokenspeed-mla` and scheduler versions from main.
 
+After all package installations, the helper copies the validated
+`$CUDA_HOME/bin/ptxas` into both `tokenspeed-triton` bundled assembler paths
+(`ptxas` and `ptxas-blackwell`) inside the active venv. This is a deliberate
+local modification of the installed wheel. Triton `3.8.10.post20260920`
+selects `ptxas-blackwell` for Hopper too, and ships CUDA 13.4 at that path;
+setting `CUDA_HOME` alone does not change Triton's choice. The helper then
+checks the actual sm90 assembler selection in a fresh Python process and
+fails unless it reports CUDA 12.9. It does not need a GPU for this check.
+
+The copied tools persist across new shells and worker processes; no additional
+exports or venv reactivation are required. Every run of the installer reapplies
+them after pip, including after Triton upgrades. If Triton is reinstalled
+separately, rerun this installer before serving. Explicit
+`TRITON_PTXAS_PATH` and `TRITON_PTXAS_BLACKWELL_PATH` overrides are preserved,
+but installation rejects them unless they point to working CUDA 12.9 tools.
+Overrides set later can still bypass the installed tools. Shared or editable
+Triton installations outside the active venv are rejected.
+
 The kernel build uses that adjusted dependency metadata, skips its default
 build-time pip install, and rebuilds the in-tree CUDA kernels for `sm90a`.
 Each kernel group records its successful build's CUDA toolkit, compiler paths,
@@ -97,7 +116,22 @@ tests:
 tokenspeed env
 python -c 'import torch; import tokenspeed_kernel; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())'
 tokenspeed serve --help
+python -c 'from tokenspeed_triton.backends.nvidia.compiler import get_ptxas_for_arch; tool = get_ptxas_for_arch(90); print(tool.path, tool.version)'
 ```
 
 Dependency checks alone do not validate binary ABI compatibility or model
 serving correctness.
+
+For DeepSeek V4.1, check the compressor metadata kernel before loading the
+model, then validate serving on the target GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -X faulthandler -m pytest -q \
+  tokenspeed-kernel/test/ops/test_attention_dsv41.py \
+  -k 'compressor_metadata_consecutive_requests_and_refresh and cuda'
+```
+
+Use `--chunked-prefill-size 8192` for initial serving validation. This controls
+the per-iteration token budget and startup tuning batch, independently of the
+model's maximum context length. A successful assembler check does not by itself
+establish that a CUDA driver loading fault or a model serving failure is fixed.
