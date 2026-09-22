@@ -33,6 +33,7 @@ from __future__ import annotations
 from tokenspeed_scheduler import PD
 
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
+from tokenspeed.runtime.pd.logprobs import snapshot_prefill_logprobs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 
 
@@ -55,6 +56,9 @@ class PdTransferHooks:
             state = loop.output_processor.rid_to_state.get(request_id)
             if state is not None:
                 loop.kv_transfer.record_cached_tokens(request_id, state.cached_tokens)
+                payload = snapshot_prefill_logprobs(state)
+                if payload is not None:
+                    loop.kv_transfer.record_logprobs(request_id, payload)
 
     def poll_transfer_events(self) -> list:
         """Poll the KV transfer executor, act on its events, and return the
@@ -77,10 +81,11 @@ class PdTransferHooks:
                 req_id = event.request_id
                 bootstrap_token = event.bootstrap_token
                 cached_tokens = loop.kv_transfer.pop_remote_cached_tokens(req_id)
+                logprobs = loop.kv_transfer.pop_remote_logprobs(req_id)
                 state = loop.output_processor.rid_to_state.get(req_id)
                 if state is None or not state.to_abort:
                     loop.output_processor.on_remote_prefill_done(
-                        req_id, bootstrap_token, cached_tokens
+                        req_id, bootstrap_token, cached_tokens, logprobs=logprobs
                     )
                 processed.extend(
                     loop.output_processor.finish_remote_prefill_only_request(req_id)

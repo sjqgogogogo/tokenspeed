@@ -109,8 +109,6 @@ class InputProcessor:
             failures.append("attention CP=1")
         if args.dp_sampling:
             failures.append("dp_sampling=False")
-        if args.disaggregation_mode != "null":
-            failures.append("monolithic serving (disaggregation_mode='null')")
         if (
             getattr(obj, "input_embeds", None) is not None
             or getattr(obj, "precomputed_multimodal_inputs", None) is not None
@@ -394,8 +392,6 @@ class InputProcessor:
             raise ValueError(
                 "return_logprob does not support speculative decoding (MTP/DSPARK/EAGLE3/DFLASH)"
             )
-        if return_logprob and self.engine.server_args.disaggregation_mode != "null":
-            raise ValueError("return_logprob requires non-disaggregated serving")
         # Output logprobs are gated by the static server arg enable_output_logprobs
         # (the sampler only gathers them when on). Reject loudly instead of
         # silently returning empty logprobs when the server cannot honor it.

@@ -102,6 +102,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.step_counter = None
         # Bootstrap metadata is published after the final forward commits.
         self.prefill_metadata: dict[int, tuple[int, list[int] | None]] = {}
+        self.prefill_logprobs: dict[int, bytes] = {}
         self.cached_tokens: dict[int, int] = {}
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
@@ -168,10 +169,17 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             if self.request_status.get(room) not in (None, TransferPoll.Failed):
                 self.cached_tokens[room] = cached_tokens
 
+    def record_logprobs(self, room: int, payload: bytes) -> None:
+        """Publish an immutable host result before bootstrap completion is released."""
+        with self.bootstrap_token_cond:
+            if self.request_status.get(room) not in (None, TransferPoll.Failed):
+                self.prefill_logprobs[room] = payload
+
     def begin_room(self, room: int) -> None:
         """Reset request metadata before publishing a room."""
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
+            self.prefill_logprobs.pop(room, None)
             self.cached_tokens.pop(room, None)
         self.update_status(room, TransferPoll.Bootstrapping)
 
@@ -181,6 +189,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.request_status.pop(room, None)
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
+            self.prefill_logprobs.pop(room, None)
             self.cached_tokens.pop(room, None)
             self.bootstrap_token_cond.notify_all()
 
@@ -711,6 +720,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         )
         with self.bootstrap_token_cond:
             cached_tokens = self.cached_tokens.get(room, 0)
+            logprobs = (
+                self.prefill_logprobs.get(room)
+                if status == TransferPoll.Success
+                else None
+            )
         socket, lock = self._connect("tcp://" + remote + ":" + str(dst_port))
         with lock:
             socket.send_multipart(
@@ -722,6 +736,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     spec_candidate_payload,
                     str(cached_tokens).encode("ascii"),
                 ]
+                + ([logprobs] if logprobs is not None else [])
             )
 
     def abort_room(self, room: int, reason: str) -> None:

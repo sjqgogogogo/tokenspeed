@@ -119,6 +119,9 @@ class _DecodeExecutor(DisaggDecodeExecutor):
     def generate_events(self):
         return self._events
 
+    def pop_remote_logprobs(self, request_id):
+        return None
+
     def pop_remote_cached_tokens(self, request_id):
         return 0
 
@@ -177,7 +180,7 @@ def _planned(*, num_extends, label=None):
 def _loop(trace, kv_transfer, state):
     output_processor = SimpleNamespace(
         rid_to_state={"r0": state} if state is not None else {},
-        on_remote_prefill_done=lambda rid, tok, cached_tokens: trace.append(
+        on_remote_prefill_done=lambda rid, tok, cached_tokens, *, logprobs: trace.append(
             ("bootstrap", tok)
         ),
         finish_remote_prefill_only_request=lambda rid: [],
@@ -882,7 +885,9 @@ def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests(
     loop = SimpleNamespace(
         kv_transfer=transfer,
         output_processor=SimpleNamespace(
-            rid_to_state={"hit": SimpleNamespace(cached_tokens=1280)}
+            rid_to_state={
+                "hit": SimpleNamespace(cached_tokens=1280, return_logprob=False)
+            }
         ),
     )
     hooks = PdTransferHooks(loop, None)

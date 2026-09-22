@@ -435,7 +435,7 @@ executor's two-copy path (`get_packed_output_d2h` returns None).
 ### Raw-logprob graph observation
 
 Output-logprob enablement prepares diagnostic decode assets for supported
-non-speculative, monolithic CUDA execution. Ordinary requests keep their original
+non-speculative CUDA execution, including PD decode nodes. Ordinary requests keep their original
 graph; diagnostic Top-K requests select a capture of the same `_forward_step`
 with a pre-sampling raw-logit snapshot. This is a capture parameter, never a
 second metadata, attention, sampling, or scheduler path.

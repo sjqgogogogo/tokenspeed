@@ -277,7 +277,6 @@ class ModelExecutorConfig:
             enable_logprob_graph=(
                 (server_args.enable_output_logprobs or server_args.enable_logprob_graph)
                 and server_args.speculative_algorithm is None
-                and server_args.disaggregation_mode == "null"
                 and server_args.mapping.pp_size == 1
                 and server_args.mapping.attn.cp_size == 1
                 and not server_args.dp_sampling

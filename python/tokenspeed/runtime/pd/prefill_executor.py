@@ -281,6 +281,11 @@ class DisaggPrefillExecutor:
         if sender is not None:
             self.kv_manager.record_cached_tokens(sender.bootstrap_room, cached_tokens)
 
+    def record_logprobs(self, request_id: str, payload: bytes) -> None:
+        sender = self.senders.get(request_id)
+        if sender is not None:
+            self.kv_manager.record_logprobs(sender.bootstrap_room, payload)
+
     def register(
         self,
         request_id: str,

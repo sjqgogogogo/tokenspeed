@@ -35,11 +35,11 @@ Top-K 与 input 实际 token 分数来自模型 logits 的 FP32 log-softmax，�
 
 新 `--enable-input-logprobs` 默认关闭；仅启用 output 不会隐式开启 input。现有 `--enable-output-logprobs` 不是“导出全部 logits”开关，原本只驱动实际生成 token 的 logprob 计算。本扩展仍要求该开关，以复用既有采样分数路径。
 
-保留服务原本的 CUDA Graph、overlap schedule、prefill graph 和 prefix cache 配置。非 MTP、非 PD 单体服务在开启 output logprobs 时自动准备可支持的 decode graph 快照；`--enable-logprob-graph` 保留为兼容开关，不再是必需参数。
+保留服务原本的 CUDA Graph、overlap schedule、prefill graph 和 prefix cache 配置。非 MTP 的单体服务及 PD decode 节点在开启 output logprobs 时自动准备可支持的 decode graph 快照；`--enable-logprob-graph` 保留为兼容开关，不再是必需参数。
 
 请求 input logprobs（`return_logprob=True, logprob_start_len>=0`）时，Python 请求入口设置 C++ `RequestSpec.reuse_prefix_cache=False`。scheduler 在每次 admission（包括 retraction 后重入）绕过 L1/L2 前缀读取，为重新计算分配私有可写块；完成块仍按原规则发布缓存，其他请求可继续命中。只请求 output 分数/top-K 的请求继续正常复用缓存。需重新编译安装 `tokenspeed-scheduler`，仅更新 Python 源码不足以加入这个字段。
 
-本期要求 prompt/top-K 请求 `stream=False`、单体服务、无 speculative decoding、PP=1、Attention CP=1、`dp_sampling=False`，请求内容为纯文本/token IDs。支持 attention TP、DP 及其组合，也允许同一 attention replica 内的 dense TP/DP 布局。模型具有视觉能力本身不是拒绝条件；实际图片、视频、音频和 embedding 输入仍拒绝。所有 return_logprob 请求（包括只取输出 token 分数）在 MTP/DSPARK/EAGLE3/DFLASH 或 PD 配置下明确报错。非投机、非 PD 的 sampled-output-only 请求仍可流式输出。GPU 数值与实际并行行为仍需验收，CPU 测试不能替代它们。
+本期要求 prompt/top-K 请求 `stream=False`、无 speculative decoding、PP=1、Attention CP=1、`dp_sampling=False`，请求内容为纯文本/token IDs。支持 attention TP、DP 及其组合，也允许同一 attention replica 内的 dense TP/DP 布局。模型具有视觉能力本身不是拒绝条件；实际图片、视频、音频和 embedding 输入仍拒绝。所有 return_logprob 请求（包括只取输出 token 分数）在 MTP/DSPARK/EAGLE3/DFLASH 配置下明确报错。非投机的 sampled-output-only 请求仍可流式输出。GPU 数值与实际并行行为仍需验收，CPU 测试不能替代它们。
 
 ## 直接使用 Python 引擎
 
@@ -229,3 +229,47 @@ DP 场景应指定 dist-init-addr，并确认启动打印的实际 mapping。使
 `test/runtime/execution/test_dp_logprob_contract.py` 覆盖 CPU 行数与切分协议；
 `test/runtime/execution/test_logprob_overlap_cuda.py` 覆盖真实 CUDA graph 的
 快照生命周期。模型权重、attention/MoE 数值、NCCL 多卡组合仍需目标机验收。
+
+
+## PD 分离下的评分归属与传输
+
+无投机的 PD 服务复用相同评分和图执行路径。Prefill 计算所有 input 分数，
+以及 output 位置 0 的实际 token 分数和 top-K；Decode 接收这些分数，再
+追加本地生成的 output 位置 1 及以后。P、D 两端都必须开启所需的 logprob
+开关，使用同一模型/tokenizer，且同时更新运行时代码。V4 Flash 与 V4.1
+Flash 复用该模型无关协议；模型自身的并行布局限制仍然生效。
+
+变长分数不放入 KV arena，不注册到 Mooncake GPU 通信缓冲区。
+`PdTransferHooks.record_prefill_usage` 在原有 forward commit 后读取已经
+完成 D2H 的请求状态，只有最终 prefill chunk 才冻结评分；版本化 MessagePack
+字节作为现有 ZMQ completion 消息的可选第七帧传输。原六帧消息保持可读。
+分数发布早于 bootstrap metadata 解锁，所以 layerwise KV 提前发送也不能
+使成功消息越过评分提交。传输状态由既有 transfer executors 管理，event loop
+不持有额外结果队列，不增加 CUDA 同步或 overlap drain。
+
+Decode 的 route barrier 先收齐预期 Prefill ranks，将分数和 bootstrap
+metadata 保存后才发布 Success。Executor 在 receiver 清理前取出分数，
+现有 PD hook 在首 token 入队之前恢复 RequestState。即使 max_new_tokens=1
+或首 token 是 EOS，不执行任何本地 decode forward 也可返回完整结果。
+请求结束/失败清理 room 的已完成和待完成 payload，迟到的完成消息不能
+重新写入终态 room。异构 TP 的完成顺序不决定评分是否保留；DP 继续使用
+既有 bootstrap-room 路由，不向其他请求拼接分数。
+
+Payload 校验版本、prompt token 摘要与长度、start/K、bootstrap token 和
+评分数量。缺失或不匹配会显式中止该请求，不伪造分数。旧 P 配新 D 可继续
+处理未请求评分的流量，但评分请求需要两端升级。
+CPU 序列化和传输成本为 O(prompt_length × K)，并可能按既有 TP 传输边复制；
+不代表诊断无额外内存/延迟，也不适合直接按无诊断吞吐评估。
+
+Dynamo 的 P 流仍提前返回 bootstrap 握手，之后排空原引擎请求。完整分数
+由 D 的正常响应转换返回：output 在 `choices[].logprobs`，input 在
+`nvext.engine_data.input_logprobs`。请求路径仍是 `/v1/completions`；无需
+在 Rust router 的 PrefillResult 中再拼接另一份评分。
+
+CPU 回归增加 `test/runtime/execution/test_pd_logprob_transfer.py`，覆盖传输
+序列化、首 token 结束、EOS、D 首轮追加、异构来源完成顺序、失败和 room
+清理。GPU 验收先使用 P TP4/DP1 + D TP4/DP1，再切换 D TP1/DP4；P/D 每端
+world_size=4，保留 overlap 与 decode graph、关闭投机。分别测 input-only、
+output-only、双方不同 K、max_tokens=1、多轮 decode、跨 chunk 长输入、并发
+不同 prompt、取消后再次请求。应核对完整 IDs/长度/null/有限值，记录 graph
+实际 replay，再与单体同配置结果作数值对比。CPU 通过不替代这一验收。

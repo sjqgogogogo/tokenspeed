@@ -424,3 +424,16 @@ requests retain the full prompt rows; ordinary requests retain the completing
 tail or one row for an open chunk. `DpForwardMetadata` owns these values for the
 submitted forward. The device side must not infer peer row counts from mutable
 request state or synchronize GPU metadata to recover them.
+
+
+### PD logprob completion ownership
+
+After output assembly at the existing forward commit fence, the PD hook freezes
+completed Prefill logprobs as immutable CPU bytes before remote-decode dispatch.
+The transfer executor owns these bytes by bootstrap room, alongside completion
+metadata. Variable-length diagnostics do not change KV/cache allocation and are
+not retained as graph-buffer views. Decode consumes the payload through the
+existing RemotePrefillDone hook before exposing the bootstrap token or emitting
+its finish event. The hook returns events to the existing scheduler-feedback
+site; no additional scheduler advance, GPU fence, or overlap drain is introduced.
+See `prompt-logprob-diagnostics.md` for the wire contract and validation scope.

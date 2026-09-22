@@ -332,7 +332,6 @@ def test_invalid_topk_request_fails(start, count):
     [
         ("speculative_algorithm", "MTP"),
         ("pipeline_parallel_size", 2),
-        ("disaggregation_mode", "decode"),
         ("dp_sampling", True),
     ],
 )
@@ -981,4 +980,14 @@ def test_graph_capture_is_automatic_only_for_supported_logprob_execution(unsuppo
         compile(ast.Expression(value), str(path), "eval"),
         {"server_args": args, "model_config": model},
     )
-    assert enabled is (unsupported in (None, "attn_dp", "dense_dp", "multimodal"))
+    assert enabled is (unsupported in (None, "pd", "attn_dp", "dense_dp", "multimodal"))
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_non_speculative_pd_logprob_requests_are_supported(role):
+    engine = _engine()
+    engine.server_args.disaggregation_mode = role
+    assert InputProcessor(engine)._validate_top_logprobs_request(_request(0, 2), 5) == (
+        0,
+        2,
+    )

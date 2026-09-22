@@ -106,6 +106,7 @@ class RequestState:
         self.output_top_logprobs_val: list = []
         self.output_top_logprobs_idx: list = []
         self.input_logprobs_sent = False
+        self.remote_prefill_received = False
 
         # --- generation state (updated with forward step) ---
         self.output_ids: list[int] = []
@@ -1051,7 +1052,12 @@ class OutputProcesser:
         return request_changes
 
     def on_remote_prefill_done(
-        self, req_id: str, bootstrap_token: int, cached_tokens: int
+        self,
+        req_id: str,
+        bootstrap_token: int,
+        cached_tokens: int,
+        *,
+        logprobs: bytes | None = None,
     ) -> None:
         """Record the bootstrap token on a decode-node request (RemotePrefillDoneEvent).
 
@@ -1074,6 +1080,11 @@ class OutputProcesser:
         state = self.rid_to_state[req_id]
         # P and D reuse overlapping leading prefixes; never sum their hits.
         state.cached_tokens = max(state.cached_tokens, cached_tokens)
+        if bootstrap_token == -1 and state.return_logprob:
+            state.set_finish_with_abort(
+                "PD logprobs require a valid bootstrap token", notify_client=True
+            )
+            return
         if bootstrap_token == -1:
             logger.warning(
                 f"[on_remote_prefill_done] rid={req_id!s} received bootstrap_token=-1, "
@@ -1090,6 +1101,23 @@ class OutputProcesser:
                 )
                 state.grammar = None
             return
+        if state.remote_prefill_received:
+            if not state.output_ids or state.output_ids[0] != bootstrap_token:
+                state.set_finish_with_abort(
+                    "Conflicting PD bootstrap token", notify_client=True
+                )
+            return
+        from tokenspeed.runtime.pd.logprobs import restore_prefill_logprobs
+
+        try:
+            restore_prefill_logprobs(state, bootstrap_token, logprobs)
+        except ValueError as exc:
+            state.set_finish_with_abort(
+                f"PD logprob transfer failed: {exc}", notify_client=True
+            )
+            return
+        state.remote_prefill_received = True
+        state.computed_length = max(state.computed_length, state.input_length)
         state.output_ids.append(bootstrap_token)
         if state.grammar is not None:
             state.grammar.accept_token(bootstrap_token)

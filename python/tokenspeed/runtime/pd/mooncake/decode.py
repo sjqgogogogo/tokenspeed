@@ -60,7 +60,7 @@ class PrefillParallelInfo:
 
 def parse_prefill_status_message(
     parts: list[bytes],
-) -> tuple[int, int, int, int, list[int] | None, int]:
+) -> tuple[int, int, int, int, list[int] | None, int, bytes | None]:
     bootstrap_room = int(parts[0].decode("ascii"))
     status = int(parts[1].decode("ascii"))
     prefill_rank = int(parts[2].decode("ascii"))
@@ -75,6 +75,7 @@ def parse_prefill_status_message(
         bootstrap_token,
         spec_candidate_ids,
         int(parts[5].decode("ascii")) if len(parts) > 5 else 0,
+        parts[6] if len(parts) > 6 and parts[6] else None,
     )
 
 
@@ -112,6 +113,8 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         self.waiting_timeout = envs.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get()
         # The status and heartbeat threads read every field above, so publish
         # their sockets only after the manager is fully initialized.
+        self.logprobs_table: dict[int, bytes] = {}
+        self._pending_logprobs_table: dict[int, bytes] = {}
         self.start_decode_thread()
 
     def start_decode_thread(self):
@@ -200,8 +203,13 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         bootstrap_token: int,
         spec_candidate_ids: list[int] | None,
         cached_tokens: int,
+        logprobs: bytes | None = None,
     ) -> None:
-        if bootstrap_room not in self.request_status:
+        if self.request_status.get(bootstrap_room) in (
+            None,
+            TransferPoll.Success,
+            TransferPoll.Failed,
+        ):
             return
         if status == TransferPoll.Success:
             expected_prefill_ranks = self.expected_prefill_ranks_table.get(
@@ -235,6 +243,9 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                     bootstrap_room, spec_candidate_ids
                 )
 
+            if logprobs is not None:
+                self._pending_logprobs_table.setdefault(bootstrap_room, logprobs)
+
             expected_response_num = len(expected_prefill_ranks)
             arrived_response_num = len(self.prefill_response_tracker[bootstrap_room])
             if arrived_response_num < expected_response_num:
@@ -259,6 +270,9 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                 self.spec_candidate_ids_table[bootstrap_room] = (
                     self._pending_spec_candidate_ids_table.pop(bootstrap_room)
                 )
+            payload = self._pending_logprobs_table.pop(bootstrap_room, None)
+            if payload is not None:
+                self.logprobs_table[bootstrap_room] = payload
             self.update_status(bootstrap_room, TransferPoll.Success)
             return
 
@@ -284,6 +298,9 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
             self.spec_candidate_ids_table.pop(bootstrap_room, None),
             self.cached_tokens_table.pop(bootstrap_room, 0),
         )
+
+    def pop_logprobs(self, bootstrap_room: int) -> bytes | None:
+        return self.logprobs_table.pop(bootstrap_room, None)
 
     def get_session_id(self):
         return self.engine.get_session_id()

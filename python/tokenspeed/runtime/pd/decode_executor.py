@@ -42,6 +42,7 @@ class DisaggDecodeExecutor:
         self._admissions: dict[str, tuple[int, int]] = {}
         self._remote_cache_slots: dict[str, int] = {}
         self._remote_cached_tokens: dict[str, int] = {}
+        self._remote_logprobs: dict[str, bytes] = {}
         self._remote_spec_candidate_ids: dict[str, tuple[int, list[int]]] = {}
 
     def _bootstrap(self, request_id, info):
@@ -146,6 +147,9 @@ class DisaggDecodeExecutor:
                 bootstrap_token, spec_candidate_ids, cached_tokens = (
                     self.kv_manager.pop_prefill_metadata(bootstrap_room)
                 )
+                payload = self.kv_manager.pop_logprobs(bootstrap_room)
+                if payload is not None:
+                    self._remote_logprobs[req_id] = payload
                 request_pool_index, local_cached_tokens = self._admissions[req_id]
                 self._remote_cache_slots[req_id] = request_pool_index
                 self._remote_cached_tokens[req_id] = max(
@@ -181,6 +185,9 @@ class DisaggDecodeExecutor:
 
     def pop_remote_spec_candidate_ids(self, request_id: str):
         return self._remote_spec_candidate_ids.pop(request_id, None)
+
+    def pop_remote_logprobs(self, request_id: str) -> bytes | None:
+        return self._remote_logprobs.pop(request_id, None)
 
     def pop_remote_cached_tokens(self, request_id: str) -> int:
         return self._remote_cached_tokens.pop(request_id)

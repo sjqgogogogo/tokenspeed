@@ -503,6 +503,8 @@ def test_terminal_events_clear_transport_room_state(
         bootstrap_token_table={9: 42},
         spec_candidate_ids_table={9: [1]},
         cached_tokens_table={9: remote_hits},
+        logprobs_table={},
+        _pending_logprobs_table={},
         _pending_bootstrap_token_table={},
         _pending_spec_candidate_ids_table={},
         connection_lock=nullcontext(),
@@ -510,6 +512,9 @@ def test_terminal_events_clear_transport_room_state(
     )
     from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 
+    decode_manager.pop_logprobs = lambda room: MooncakeKVManagerDecode.pop_logprobs(
+        decode_manager, room
+    )
     decode_manager.pop_prefill_metadata = lambda room: (
         MooncakeKVManagerDecode.pop_prefill_metadata(decode_manager, room)
     )
@@ -526,6 +531,7 @@ def test_terminal_events_clear_transport_room_state(
     decode._admissions = {}
     decode._remote_cache_slots = {}
     decode._remote_cached_tokens = {}
+    decode._remote_logprobs = {}
     decode._remote_spec_candidate_ids = {}
     decode.cache_layout = _layout()
     admission = _op()
@@ -556,6 +562,7 @@ def test_terminal_cleanup_wakes_prefill_metadata_waiter() -> None:
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.bootstrap_token_cond = threading.Condition()
     manager.prefill_metadata = {}
+    manager.prefill_logprobs = {}
     manager.cached_tokens = {}
     manager.transfer_infos = {9: {}}
     manager.request_status = {9: TransferPoll.WaitingForInput}
@@ -1176,6 +1183,8 @@ def test_decode_accepts_only_the_planned_prefill_rank_completion_set() -> None:
         value.bootstrap_token_table = {}
         value.spec_candidate_ids_table = {}
         value.cached_tokens_table = {}
+        value.logprobs_table = {}
+        value._pending_logprobs_table = {}
         value._pending_bootstrap_token_table = {}
         value._pending_spec_candidate_ids_table = {}
         value.failure_records = {}
@@ -1272,6 +1281,7 @@ def test_prefill_usage_status_wire_roundtrip():
     manager.bootstrap_token_cond = threading.Condition()
     manager.request_status = {9: TransferPoll.Bootstrapped}
     manager.prefill_metadata = {}
+    manager.prefill_logprobs = {}
     manager.cached_tokens = {}
     messages = []
     manager._connect = lambda endpoint: (
@@ -1289,9 +1299,9 @@ def test_prefill_usage_status_wire_roundtrip():
         spec_candidate_ids=[5, 6],
     )
     parsed = parse_prefill_status_message(messages[0])
-    assert parsed == (9, TransferPoll.Success, 0, 42, [5, 6], 1280)
+    assert parsed == (9, TransferPoll.Success, 0, 42, [5, 6], 1280, None)
     # Older senders lack the optional trailing usage frame.
-    assert parse_prefill_status_message(messages[0][:-1])[-1] == 0
+    assert parse_prefill_status_message(messages[0][:-1])[-2:] == (0, None)
     manager.begin_room(9)
     assert manager.prefill_metadata == {}
     assert manager.cached_tokens == {}
@@ -1307,6 +1317,7 @@ def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
     manager.bootstrap_token_cond = threading.Condition()
     manager.request_status = {9: TransferPoll.WaitingForInput}
     manager.prefill_metadata = {}
+    manager.prefill_logprobs = {}
     manager.cached_tokens = {}
     manager.record_cached_tokens(9, 1280)
     done = threading.Event()
