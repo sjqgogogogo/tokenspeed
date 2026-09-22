@@ -32,6 +32,29 @@ files, and required runtime libraries. The recipe does not run apt or sudo.
 Each pip call uses the active Python interpreter; proxy environment variables
 are inherited.
 
+The installer reuses `flashinfer-cubin` when its installed version exactly
+matches the checkout's FlashInfer pin. It passes a named requirement to pip
+instead of the release URL, avoiding another metadata download of the large
+wheel. Missing or different versions still come from the pinned GitHub release.
+Downloads default to a 120-second socket timeout, 10 connection retries and
+20 incomplete-download resume/restart attempts. Explicit `PIP_TIMEOUT` /
+`PIP_DEFAULT_TIMEOUT`, `PIP_RETRIES` and `PIP_RESUME_RETRIES` values are preserved.
+These are pip's own retry controls, not a guarantee that an interrupted partial
+download survives a separate installer invocation or that a proxy supports
+resuming it. A slow or unreliable connection can use, for example:
+
+```bash
+PIP_DEFAULT_TIMEOUT=300 PIP_RESUME_RETRIES=50 \
+  CUDA_VARIANT=cu129 bash test/ci_system/install_deps.sh
+```
+
+An `incomplete-download` error is a failed wheel transfer, not a dependency
+version conflict. Retry after fixing connectivity. Alternatively, download the
+official pinned wheel through a working connection, install that local file
+with `python -m pip install --no-deps /path/to/flashinfer_cubin-<version>-py3-none-any.whl`,
+and rerun this installer; the matching installed version will then be reused.
+The installer still finishes with `pip check` and verifies Triton's assembler.
+
 The helper rejects installed CUDA 13 runtime packages and Torch wheels marked
 cu13 before changing packages. It reports the conflicting distributions and
 leaves them installed. Use a fresh cu129 venv instead of mixing the two stacks;

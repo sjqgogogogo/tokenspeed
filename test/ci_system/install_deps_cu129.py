@@ -203,6 +203,35 @@ def pip_install(arguments: list[str], index: str) -> None:
     )
 
 
+def configure_pip_downloads() -> None:
+    """Allow large wheels more time/retries, preserving explicit pip overrides."""
+    if not any(name in os.environ for name in ("PIP_TIMEOUT", "PIP_DEFAULT_TIMEOUT")):
+        os.environ["PIP_DEFAULT_TIMEOUT"] = "120"
+    os.environ.setdefault("PIP_RETRIES", "10")
+    os.environ.setdefault("PIP_RESUME_RETRIES", "20")
+
+
+def flashinfer_cubin_requirement(version: str) -> str:
+    """Reuse an exact installed cubin version; otherwise select its release wheel.
+
+    Passing the direct URL unconditionally makes pip fetch the large wheel to
+    inspect its metadata even when that version is already installed. A named
+    exact requirement lets pip keep the installed distribution while still
+    checking its dependencies.
+    """
+    try:
+        installed = importlib.metadata.version("flashinfer-cubin")
+    except importlib.metadata.PackageNotFoundError:
+        installed = None
+    if installed == version:
+        print(f"Reusing installed flashinfer-cubin=={version}", flush=True)
+        return f"flashinfer-cubin=={version}"
+    return (
+        "https://github.com/flashinfer-ai/flashinfer/releases/download/"
+        f"v{version}/flashinfer_cubin-{version}-py3-none-any.whl"
+    )
+
+
 def main() -> None:
     workspace = Path(os.environ.get("WORKSPACE", Path(__file__).resolve().parents[2]))
     workspace = workspace.resolve()
@@ -240,6 +269,7 @@ def main() -> None:
         f"Experimental Hopper/cu129 install: {workspace}, Python: {sys.executable}",
         flush=True,
     )
+    configure_pip_downloads()
 
     pip_install(["--upgrade", "pip", "setuptools==83.0.0", "wheel", "packaging"], PYPI)
     requirements = kernel_requirements(workspace)
@@ -259,10 +289,7 @@ def main() -> None:
         for req in requirements
         if req.startswith("flashinfer-python==")
     )
-    cubin = (
-        "https://github.com/flashinfer-ai/flashinfer/releases/download/"
-        f"v{flashinfer}/flashinfer_cubin-{flashinfer}-py3-none-any.whl"
-    )
+    cubin = flashinfer_cubin_requirement(flashinfer)
     # Resolve native wheels' transitive dependencies after the right binaries
     # are installed. Matching public versions (including local suffixes) stay.
     pip_install([*requirements, *mooncake, cubin], PYPI)
