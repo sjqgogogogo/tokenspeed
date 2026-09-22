@@ -1872,6 +1872,8 @@ def _deepseek_v4_expert_scale_parameter_name(
 
 
 class DeepseekV4MoE(nn.Module):
+    supports_scattered_attention_tp = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1928,7 +1930,10 @@ class DeepseekV4MoE(nn.Module):
                     "DeepSeek V4 normal EP does not support redundant experts "
                     "with precomputed routing."
                 )
-            if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
+            if (
+                not self.supports_scattered_attention_tp
+                and mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size)
+            ):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "
                     "attention TP size equal to the MoE TPxEP size."

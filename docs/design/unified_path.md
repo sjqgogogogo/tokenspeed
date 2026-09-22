@@ -293,12 +293,15 @@ from a loose argument a captured break would freeze. Capture runs the
 narrowing before every decoder run, as serving does: the decoder consumes
 per-forward backend state its predecessor produces (V4.1's reuse layers read
 the index source's selection, which later sources overwrite). Under
-attention DP the split graph stays off: the narrowed row count is rank-local
-(which prompts complete on this rank), so the decoder bucket and the
-collective shapes its graph bakes would differ across ranks, and the stages
-size their collectives from their own rows, which the DP metadata gather
-does not carry (the same gap that keeps narrowing itself unimplemented under
-DP).
+attention DP, eager stages receive encoder and decoder counts gathered on the
+control plane. Empty ranks join the same per-layer MoE collectives. The split
+prefill graph still stays off until encoder and decoder bucket choices are
+replicated across ranks; decode CUDA graphs retain their common padded shape.
+Input-logprob forwards request full decoder rows through metadata, preserving
+causal prefill spans instead of the generation-only tail. Graph replay and eager
+execution consume the same view; an oversized decoder view uses the existing
+above-capacity eager fallback.
+
 
 ### One draft metadata contract
 
@@ -428,6 +431,31 @@ Triton backends return separate token and length buffers and take the
 executor's two-copy path (`get_packed_output_d2h` returns None).
 
 ## What stays graph-only
+
+### Raw-logprob graph observation
+
+Output-logprob enablement prepares diagnostic decode assets for supported
+non-speculative, monolithic CUDA execution. Ordinary requests keep their original
+graph; diagnostic Top-K requests select a capture of the same `_forward_step`
+with a pre-sampling raw-logit snapshot. This is a capture parameter, never a
+second metadata, attention, sampling, or scheduler path.
+
+The snapshot lives outside graph pools. The forward thread replays, computes
+live-row Top-K, and enqueues owned D2H results on the existing execution stream
+before it starts the next forward. The result's copy event covers these copies;
+`PendingExecution.result()` is still the only commit fence. Overlap introduces
+no extra drain or global synchronize. CPU consumers never retain a view of the
+persistent snapshot. Input-only K=0 decode uses the original graph.
+
+Prefill graph already ends in the model's eager logits tail. The same
+`LogitsMetadata.from_forward_context` passes the forward-local diagnostic controls
+through that tail; prompt scoring does not require disabling prefill graph.
+Above-ladder batches retain the ordinary eager route; an eligible diagnostic
+replay with missing capture assets fails rather than changing execution mode.
+`TOKENSPEED_GRAPH_DEBUG=1` reports replay and configured overlap depth. Actual
+GPU correctness and overlap must be verified independently of CPU mock tests.
+
+Scope and numerical conventions are in `prompt-logprob-diagnostics.md`.
 
 Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
 of replaying a recorded graph: input-buffer padding to the ladder bs plus the

@@ -32,7 +32,7 @@ from types import SimpleNamespace
 import pytest
 
 from tokenspeed.runtime.execution.device import DeviceHandle, DeviceRole
-from tokenspeed.runtime.execution.types import PlannedForward
+from tokenspeed.runtime.execution.types import LogprobRequestConfig, PlannedForward
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 
@@ -118,6 +118,7 @@ def _planned(*, num_extends=0):
             num_extends=lambda: num_extends,
         ),
         sampling_params_list=[object()],
+        logprob_configs=(LogprobRequestConfig(False, -1, 0, ()),),
         dp_metadata=None,
         grammar_inputs="GRAMMAR",
         multimodal_context="MM",

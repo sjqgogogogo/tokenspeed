@@ -56,6 +56,75 @@ class InputProcessor:
     def __init__(self, engine: AsyncLLM):
         self.engine = engine
 
+    def _validate_top_logprobs_request(
+        self, obj: GenerateReqInput, input_token_num: int
+    ) -> tuple[int, int]:
+        """Validate the opt-in, text-only prompt/Top-K diagnostic capability.
+
+        Return the requested prompt token start and candidate count. Ordinary
+        generation and sampled-token-only logprobs retain their existing path.
+        """
+        start = getattr(obj, "logprob_start_len", None)
+        start = -1 if start is None else start
+        count = getattr(obj, "top_logprobs_num", None)
+        count = 0 if count is None else count
+        if isinstance(start, bool) or not isinstance(start, int):
+            raise ValueError("logprob_start_len must be an integer")
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError("top_logprobs_num must be an integer")
+        if not -1 <= start < input_token_num:
+            raise ValueError(
+                "logprob_start_len must be -1 or a prompt token index "
+                f"in [0, {input_token_num})"
+            )
+        if not 0 <= count <= self.engine.model_config.vocab_size:
+            raise ValueError("top_logprobs_num must be between 0 and vocab_size")
+        if start >= 0 and not self.engine.server_args.enable_input_logprobs:
+            raise ValueError(
+                "Prompt logprobs were requested but the server was started without "
+                "--enable-input-logprobs; enable both --enable-input-logprobs "
+                "and --enable-output-logprobs to collect prompt logprobs."
+            )
+        if self.engine.server_args.speculative_algorithm is not None:
+            raise ValueError("return_logprob does not support speculative decoding")
+        if count == 0 and start < 0:
+            return start, count
+        if obj.stream:
+            raise ValueError("Prompt/Top-K diagnostics require stream=False")
+        fmt = getattr(obj, "logprob_format", None)
+        if fmt not in (None, "sglang", "both") or (
+            fmt is None and (obj.sampling_params or {}).get("logprobs") is not None
+        ):
+            raise ValueError(
+                "Top-K diagnostics require logprob_format='sglang' or 'both'"
+            )
+
+        args = self.engine.server_args
+        failures = []
+        if not args.enforce_eager and args.device != "cuda":
+            failures.append("device='cuda' for graph logprob diagnostics")
+        if args.pipeline_parallel_size != 1:
+            failures.append("pipeline_parallel_size=1")
+        if args.mapping.attn.cp_size != 1:
+            failures.append("attention CP=1")
+        if args.dp_sampling:
+            failures.append("dp_sampling=False")
+        if args.disaggregation_mode != "null":
+            failures.append("monolithic serving (disaggregation_mode='null')")
+        if (
+            getattr(obj, "input_embeds", None) is not None
+            or getattr(obj, "precomputed_multimodal_inputs", None) is not None
+            or bool(getattr(obj, "image_data", None))
+            or bool(getattr(obj, "video_data", None))
+            or bool(getattr(obj, "audio_data", None))
+        ):
+            failures.append("text/token-ID inputs without multimodal embeddings")
+        if failures:
+            raise ValueError(
+                "Top-K diagnostics currently require " + ", ".join(failures)
+            )
+        return start, count
+
     def _maybe_wrap_json_schema_for_reasoning(self, sampling: dict) -> None:
         # Without this, xgrammar locks onto ``{`` at token 0 and the
         # model can't emit ``<think>…</think>`` before the JSON.
@@ -317,12 +386,16 @@ class InputProcessor:
 
         # Output logprobs: two request dialects, one compute path. vLLM uses
         # sampling_params.logprobs; SGLang uses GenerateReqInput.return_logprob
-        # (+ top_logprobs_num / logprob_start_len / token_ids_logprob). Either way
-        # the scheduler computes only the sampled token's logprob; the response
-        # dialect is chosen at render time. Gate unsupported CAPABILITIES loudly
-        # here rather than silently clamping the request shape.
+        # (+ top_logprobs_num / logprob_start_len / token_ids_logprob). The
+        # sampled-token path stays unchanged; Top-K diagnostics are opt-in.
         sglang_req = bool(getattr(obj, "return_logprob", False))
         return_logprob = sampling_params.logprobs is not None or sglang_req
+        if return_logprob and self.engine.server_args.speculative_algorithm is not None:
+            raise ValueError(
+                "return_logprob does not support speculative decoding (MTP/DSPARK/EAGLE3/DFLASH)"
+            )
+        if return_logprob and self.engine.server_args.disaggregation_mode != "null":
+            raise ValueError("return_logprob requires non-disaggregated serving")
         # Output logprobs are gated by the static server arg enable_output_logprobs
         # (the sampler only gathers them when on). Reject loudly instead of
         # silently returning empty logprobs when the server cannot honor it.
@@ -332,23 +405,15 @@ class InputProcessor:
                 "enable_output_logprobs; restart with enable_output_logprobs=True "
                 "to return output logprobs."
             )
-        if sglang_req:
-            # vLLM top-k / full-vocab are gated in SamplingParams.verify(); gate
-            # the SGLang capability knobs here for parity.
-            if getattr(obj, "top_logprobs_num", 0):
-                raise ValueError(
-                    "top_logprobs_num > 0 (output top-k logprobs) is not supported "
-                    "yet; use top_logprobs_num=0 (the sampled token's logprob)."
-                )
-            if (getattr(obj, "logprob_start_len", -1) or -1) >= 0:
-                raise ValueError(
-                    "logprob_start_len >= 0 (prompt logprobs) is not supported yet."
-                )
-            if getattr(obj, "token_ids_logprob", None):
-                raise ValueError("token_ids_logprob is not supported yet.")
         logprob_start_len = -1
         top_logprobs_num = 0
         token_ids_logprob = None
+        if sglang_req:
+            logprob_start_len, top_logprobs_num = self._validate_top_logprobs_request(
+                obj, input_token_num
+            )
+            if getattr(obj, "token_ids_logprob", None):
+                raise ValueError("token_ids_logprob is not supported yet.")
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(

@@ -51,6 +51,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.execution.logprob_utils import TopLogprobCapture
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
@@ -58,6 +59,7 @@ from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
+    LogprobRequestConfig,
     ModelExecutionResult,
     NGramInputs,
 )
@@ -162,6 +164,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
+    enable_logprob_graph: bool
     prefix_granularity: int
     max_num_seqs: int
     chunked_prefill_size: int
@@ -271,6 +274,14 @@ class ModelExecutorConfig:
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
+            enable_logprob_graph=(
+                (server_args.enable_output_logprobs or server_args.enable_logprob_graph)
+                and server_args.speculative_algorithm is None
+                and server_args.disaggregation_mode == "null"
+                and server_args.mapping.pp_size == 1
+                and server_args.mapping.attn.cp_size == 1
+                and not server_args.dp_sampling
+            ),
             prefix_granularity=prefix_granularity,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
@@ -1041,6 +1052,11 @@ class ModelExecutor:
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
 
+        if ctx.raw_logit_snapshot is not None:
+            ctx.raw_logit_snapshot.capture(logits_output)
+        if ctx.top_logprob_capture is not None:
+            ctx.top_logprob_capture.capture(logits_output)
+
         candidates = self._decode_candidates(ctx)
 
         if self.capturable_grammar is not None:
@@ -1162,6 +1178,7 @@ class ModelExecutor:
             input_num_tokens=0,
             forward_mode=graph_forward_mode,
             global_num_tokens=dp_metadata.global_num_tokens,
+            global_decoder_num_tokens=dp_metadata.global_decoder_num_tokens,
             global_bs=dp_metadata.global_batch_size,
             all_decode_or_idle=dp_metadata.all_decode_or_idle,
         )
@@ -1388,6 +1405,7 @@ class ModelExecutor:
         self,
         forward_op,
         sampling_params_list: list[SamplingParams],
+        logprob_configs: tuple[LogprobRequestConfig, ...],
         dp_metadata: DpForwardMetadata | None = None,
         grammar_inputs=None,
         multimodal_context=None,
@@ -1399,6 +1417,22 @@ class ModelExecutor:
         self.log_step += 1
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
+        topk_capture = None
+        if any(
+            c.return_logprob
+            and (
+                c.top_logprobs_num > 0
+                or (index < num_extends and c.logprob_start_len >= 0)
+            )
+            for index, c in enumerate(logprob_configs)
+        ):
+            topk_capture = TopLogprobCapture(
+                logprob_configs,
+                num_extends,
+                tuple(forward_op.input_lengths),
+                self.runtime_states.vocab_size,
+            )
+        topk_result = {}
         self._active_multimodal_context = multimodal_context
         self._active_positions_override = None
         timing_enabled = LOG_MM_TIMING
@@ -1525,6 +1559,12 @@ class ModelExecutor:
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
+                    top_logprob_capture=topk_capture,
+                    logprob_diagnostic=any(
+                        c.return_logprob
+                        and (c.top_logprobs_num > 0 or c.logprob_start_len >= 0)
+                        for c in logprob_configs
+                    ),
                     decode_input_ids=decode_input_ids,
                 )
                 if self.config.data_parallel_size > 1:
@@ -1534,6 +1574,9 @@ class ModelExecutor:
                             "the event loop before model execution."
                         )
                     ctx.global_num_tokens = dp_metadata.global_num_tokens
+                    ctx.global_decoder_num_tokens = (
+                        dp_metadata.global_decoder_num_tokens
+                    )
                     ctx.global_bs = dp_metadata.global_batch_size
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
@@ -1676,6 +1719,9 @@ class ModelExecutor:
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
 
+                if topk_capture is not None:
+                    topk_result = topk_capture.copy_to_cpu()
+
                 output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = self.device_module.Event()
@@ -1707,6 +1753,7 @@ class ModelExecutor:
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
+            **topk_result,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,

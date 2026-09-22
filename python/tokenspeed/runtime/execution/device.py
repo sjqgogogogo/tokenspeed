@@ -160,6 +160,7 @@ class DeviceSpecs:
     supports_pd_layerwise_finalization: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
+    prefill_decoder_window: int | None
 
 
 @dataclass(frozen=True)
@@ -436,6 +437,7 @@ class DeviceHandle:
             return executor.execute_forward_op(
                 planned.forward_op,
                 planned.sampling_params_list,
+                logprob_configs=planned.logprob_configs,
                 dp_metadata=planned.dp_metadata,
                 grammar_inputs=planned.grammar_inputs,
                 multimodal_context=planned.multimodal_context,
@@ -1123,6 +1125,7 @@ def build_device_side(
     )
 
     specs = DeviceSpecs(
+        prefill_decoder_window=executor.prefill_graph.decoder_window,
         cache_geometry=cache_geometry,
         cache_groups=cache_groups,
         cache_storage=attention.cache_storage,

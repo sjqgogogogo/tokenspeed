@@ -413,3 +413,14 @@ For orientation, one iteration of `event_loop`:
   exception or malformed existence / prefetch result is a local miss so
   every cache-owning rank still enters the replica MIN; raising would
   hang healthy peers. Clients are not failed.
+
+
+### Decoder row counts under attention DP
+
+`DeviceSpecs.prefill_decoder_window` declares an optional prefill narrowing
+window as a CPU scalar. The DP pre-dispatch metadata gather includes each rank's
+decoder row count alongside its input tokens, batch size and mode. Input-logprob
+requests retain the full prompt rows; ordinary requests retain the completing
+tail or one row for an open chunk. `DpForwardMetadata` owns these values for the
+submitted forward. The device side must not infer peer row counts from mutable
+request state or synchronize GPU metadata to recover them.

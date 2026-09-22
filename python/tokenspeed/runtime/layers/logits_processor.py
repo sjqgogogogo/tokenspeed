@@ -48,6 +48,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.logprob_utils import split_prompt_topk
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -152,6 +153,7 @@ class LogitsMetadata:
     gather_ids: torch.Tensor | None = None
 
     extend_return_logprob: bool = False
+    keep_topk_on_device: bool = False
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
     extend_seq_lens_cpu: list[int] | None = None
@@ -159,6 +161,7 @@ class LogitsMetadata:
     extend_logprob_pruned_lens_cpu: list[int] | None = None
     top_logprobs_nums: list[int] | None = None
     extend_input_logprob_token_ids_gpu: torch.Tensor | None = None
+    extend_input_logprob_token_ids_cpu: tuple[int, ...] | None = None
     token_ids_logprobs: list[list[int]] | None = None
 
     # logits and logprobs post processing
@@ -179,10 +182,29 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_context(cls, ctx: ForwardContext):
+        capture = ctx.top_logprob_capture
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
+            extend_return_logprob=capture is not None and any(capture.pruned_lens),
+            extend_return_top_logprob=capture is not None
+            and any(
+                length and k
+                for length, k in zip(capture.pruned_lens, capture.topk_nums)
+            ),
+            keep_topk_on_device=capture is not None,
+            extend_seq_lens_cpu=None if capture is None else capture.seq_lens,
+            extend_logprob_start_lens_cpu=(
+                None if capture is None else capture.start_lens
+            ),
+            extend_logprob_pruned_lens_cpu=(
+                None if capture is None else capture.pruned_lens
+            ),
+            top_logprobs_nums=None if capture is None else capture.topk_nums,
+            extend_input_logprob_token_ids_cpu=(
+                None if capture is None else capture.input_token_ids
+            ),
         )
 
 
@@ -668,10 +690,19 @@ class LogitsProcessor(nn.Module):
             else:
                 input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
 
-            input_token_logprobs = input_logprobs[
-                torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
-                logits_metadata.extend_input_logprob_token_ids_gpu,
-            ]
+            input_token_logprobs = None
+            token_ids_gpu = logits_metadata.extend_input_logprob_token_ids_gpu
+            if logits_metadata.extend_input_logprob_token_ids_cpu is not None:
+                token_ids_gpu = torch.tensor(
+                    logits_metadata.extend_input_logprob_token_ids_cpu,
+                    dtype=torch.int64,
+                    device=input_logprobs.device,
+                )
+            if token_ids_gpu is not None:
+                input_token_logprobs = input_logprobs[
+                    torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
+                    token_ids_gpu,
+                ]
 
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
@@ -812,6 +843,12 @@ class LogitsProcessor(nn.Module):
 
     @staticmethod
     def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
+        if logits_metadata.keep_topk_on_device:
+            return split_prompt_topk(
+                all_logprobs,
+                logits_metadata.top_logprobs_nums,
+                logits_metadata.extend_logprob_pruned_lens_cpu,
+            )
         max_k = max(logits_metadata.top_logprobs_nums)
         ret = all_logprobs.topk(max_k, dim=1)
         values = ret.values.tolist()

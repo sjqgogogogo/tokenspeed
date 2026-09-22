@@ -70,6 +70,7 @@ from tokenspeed.runtime.execution.distributed_initializer import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
+    LogprobRequestConfig,
     PendingExecution,
     PlannedForward,
 )
@@ -226,6 +227,7 @@ class EventLoop:
         )
         self._device = device.handle
         specs = device.specs
+        self._prefill_decoder_window = specs.prefill_decoder_window
         self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
         self.cache_storage = specs.cache_storage
         self._scheduler_cache_geometry = specs.cache_geometry
@@ -263,8 +265,8 @@ class EventLoop:
             self.world_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.world_group
             )
-            self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-            self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
+            self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+            self._dp_global_info = torch.zeros(mapping.world_size, 4, dtype=torch.int32)
         num_host_pages = specs.num_host_pages
         # L2 cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when kvstore is disabled. The hooks
@@ -1136,6 +1138,29 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
+        decoder_tokens = num_tokens
+        if executes_model_forward and self._prefill_decoder_window is not None:
+            num_extends = forward_op.num_extends()
+            states = self.output_processor.rid_to_state
+            full_prompt = any(
+                states[rid].return_logprob and states[rid].logprob_start_len >= 0
+                for rid in forward_op.request_ids[:num_extends]
+            )
+            if not full_prompt:
+                decoder_tokens = sum(forward_op.input_lengths[num_extends:]) + sum(
+                    (
+                        min(length, self._prefill_decoder_window)
+                        if prefix + length == prompt
+                        else min(length, 1)
+                    )
+                    for length, prefix, prompt in zip(
+                        forward_op.input_lengths[:num_extends],
+                        forward_op.extend_prefix_lens,
+                        forward_op.prefill_lengths[:num_extends],
+                        strict=True,
+                    )
+                )
+        self._dp_local_info[0, 3] = decoder_tokens
         dist.all_gather_single(
             self._dp_global_info,
             self._dp_local_info,
@@ -1160,6 +1185,7 @@ class EventLoop:
         )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
+            global_decoder_num_tokens=self._dp_global_info[:, 3].tolist(),
             global_batch_size=global_batch_size,
             global_forward_mode=global_forward_mode,
             all_decode_or_idle=all_decode_or_idle,
@@ -1340,6 +1366,7 @@ class EventLoop:
                         # output_processor.rid_to_state, which would KeyError on
                         # rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
+                        logprob_configs = self._gather_logprob_configs(forward_op)
                         grammar_inputs = self._gather_grammar_state(forward_op)
                         ngram_inputs = ngram_inputs_for_forward(
                             forward_op,
@@ -1357,6 +1384,7 @@ class EventLoop:
                         planned = PlannedForward(
                             forward_op=forward_op,
                             sampling_params_list=sampling_params_list,
+                            logprob_configs=logprob_configs,
                             dp_metadata=dp_metadata,
                             grammar_inputs=grammar_inputs,
                             ngram_inputs=ngram_inputs,
@@ -1438,6 +1466,44 @@ class EventLoop:
             st = rid_to_state.get(rid)
             if st is not None:
                 st.stats.mark_scheduled(now)
+
+    def _gather_logprob_configs(self, forward_op) -> tuple[LogprobRequestConfig, ...]:
+        """Freeze CPU controls and each chunk's true next-prompt token ids.
+
+        Source t predicts prompt token t+1, including across chunk boundaries.
+        The final prompt source (and any later retraction replay rows) uses a
+        valid dummy id; commit discards those rows instead of exposing a score.
+        """
+        num_extends = forward_op.num_extends()
+        configs = []
+        for index, rid in enumerate(forward_op.request_ids):
+            state = self.output_processor.rid_to_state[rid]
+            target_ids = ()
+            if (
+                index < num_extends
+                and state.return_logprob
+                and state.logprob_start_len >= 0
+            ):
+                source_start = int(forward_op.extend_prefix_lens[index])
+                length = int(forward_op.input_lengths[index])
+                if source_start < 0 or length <= 0:
+                    raise ValueError(
+                        "Input logprob chunk must have a valid source range"
+                    )
+                prompt = state.prompt_input_ids
+                target_ids = tuple(
+                    int(prompt[source + 1]) if source + 1 < len(prompt) else 0
+                    for source in range(source_start, source_start + length)
+                )
+            configs.append(
+                LogprobRequestConfig(
+                    return_logprob=state.return_logprob,
+                    logprob_start_len=state.logprob_start_len,
+                    top_logprobs_num=state.top_logprobs_num,
+                    input_token_ids=target_ids,
+                )
+            )
+        return tuple(configs)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The

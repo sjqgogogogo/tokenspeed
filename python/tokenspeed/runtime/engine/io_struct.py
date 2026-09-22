@@ -680,8 +680,9 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
     spec_verify_ct: list[int]
 
     # Logprobs
-    input_token_logprobs_val: list[float]
-    input_token_logprobs_idx: list[int]
+    # Parallel to rids; the first prompt position may have no left context.
+    input_token_logprobs_val: list[list[float | None]]
+    input_token_logprobs_idx: list[list[int]]
     # Per-request lists, parallel to rids: the newly-decoded tokens' sampled
     # logprobs/token ids this step, [] when logprobs are off (see stream_output).
     output_token_logprobs_val: list[list[float]]
@@ -815,8 +816,9 @@ class BatchStrOut(BaseBatchReq, kw_only=True):
     spec_verify_ct: list[int]
 
     # Logprobs
-    input_token_logprobs_val: list[float]
-    input_token_logprobs_idx: list[int]
+    # Logprob columns remain batched when detokenized strings are transported.
+    input_token_logprobs_val: list[list[float | None]]
+    input_token_logprobs_idx: list[list[int]]
     output_token_logprobs_val: list[float]
     output_token_logprobs_idx: list[int]
     input_top_logprobs_val: list[list]

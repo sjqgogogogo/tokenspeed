@@ -35,6 +35,10 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.dspark_context import (
         DSparkContextProducer,
     )
+    from tokenspeed.runtime.execution.logprob_utils import (
+        RawLogitsSnapshot,
+        TopLogprobCapture,
+    )
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
@@ -121,6 +125,7 @@ class ForwardContext:
     # --- dp attention ---
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
+    global_decoder_num_tokens: list[int] | None = None
     all_decode_or_idle: bool = False
     all_extend: bool = False
     # Models that need specific collective sizing (e.g. draft models whose
@@ -132,9 +137,10 @@ class ForwardContext:
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
-    # Set by a target model that captures its taps on a narrowed row subset
-    # (see CapturedRows); None means one captured row per input row.
     captured_rows: CapturedRows | None = None
+    top_logprob_capture: TopLogprobCapture | None = None
+    raw_logit_snapshot: RawLogitsSnapshot | None = None
+    logprob_diagnostic: bool = False
 
     # --- spec-decode draft (drafter-attached collaborators, per forward) ---
     # Set on the draft forwards that narrow verify-shaped rows to the

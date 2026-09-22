@@ -293,8 +293,14 @@ class ServerArgs:
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
-    # server started without the matching flag will receive empty logprobs.
+    # server started without the matching flag are rejected.
     enable_output_logprobs: bool = False
+    # Opt-in prompt Top-K diagnostics; not an export of full-vocabulary logits.
+    # Requests also require enable_output_logprobs.
+    enable_input_logprobs: bool = False
+    # Compatibility opt-in; enable_output_logprobs also prepares supported
+    # decode graph snapshots. Prefill graphs retain their eager logits tail.
+    enable_logprob_graph: bool = False
 
     # Runtime options
     disable_pdl: bool = False
@@ -1878,6 +1884,26 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_output_logprobs,
             help="Enable per-token sampled-token logprobs. OFF by default; enabling extends the captured CUDA-graph footprint. Requests asking for logprobs on a server without this flag receive empty logprobs.",
+        )
+        parser.add_argument(
+            "--enable-input-logprobs",
+            action="store_true",
+            default=ServerArgs.enable_input_logprobs,
+            help=(
+                "Enable opt-in prompt Top-K diagnostics. OFF by default; requires "
+                "--enable-output-logprobs and requests with return_logprob=True, "
+                "logprob_start_len >= 0. Collects actual input-token logprobs "
+                "and optional Top-K; does not export full-vocabulary logits."
+            ),
+        )
+        parser.add_argument(
+            "--enable-logprob-graph",
+            action="store_true",
+            default=ServerArgs.enable_logprob_graph,
+            help=(
+                "Enable CUDA decode logprob snapshots (also enabled by "
+                "--enable-output-logprobs). Does not disable overlap or prefill graphs."
+            ),
         )
         parser.add_argument(
             "--eagle3-layers-to-capture",

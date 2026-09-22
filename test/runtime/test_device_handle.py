@@ -48,7 +48,7 @@ import torch
 from tokenspeed_scheduler import PD
 
 from tokenspeed.runtime.execution.device import DeviceHandle
-from tokenspeed.runtime.execution.types import PlannedForward
+from tokenspeed.runtime.execution.types import LogprobRequestConfig, PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -166,6 +166,7 @@ def _planned(*, num_extends, label=None):
             num_extends=lambda: num_extends,
         ),
         sampling_params_list=[],
+        logprob_configs=(LogprobRequestConfig(False, -1, 0, ()),),
         dp_metadata=None,
         grammar_inputs=None,
         multimodal_context=None,

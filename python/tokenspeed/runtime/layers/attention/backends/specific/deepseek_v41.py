@@ -647,7 +647,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
         self._refresh_decode_window(self.forward_decode_metadata)
         self._decoder_view = self._build_decoder_view(
-            meta, completes, window, forward_mode
+            meta,
+            completes,
+            window,
+            forward_mode,
+            full_prompt_logits=bool(kwargs.get("full_prompt_logits", False)),
         )
         self.sparse_topk.clear()
 
@@ -657,6 +661,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         completes: list[bool],
         window: int,
         forward_mode: ForwardMode,
+        *,
+        full_prompt_logits: bool,
     ) -> V41DecoderView:
         """Select the rows the CED decoder layers run on.
 
@@ -665,12 +671,17 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         row (its logits are discarded, and one row per request keeps the
         sampler's row contract). Decode rows are all kept. The scheduler never
         leaves a final chunk shorter than the window, so a kept tail is the
-        prompt's last window unless the whole prompt is shorter.
+        prompt's last window unless the whole prompt is shorter. Input-logprob
+        forwards retain every row and its original causal prefill span.
         """
         n = self.forward_prefill_metadata.positions.numel()
         total = meta.positions.numel()
         keeps = [
-            min(window, span.count) if done else min(1, span.count)
+            (
+                span.count
+                if full_prompt_logits
+                else (min(window, span.count) if done else min(1, span.count))
+            )
             for span, done in zip(self._prefill_spans, completes, strict=True)
         ]
         if all(keep == span.count for keep, span in zip(keeps, self._prefill_spans)):

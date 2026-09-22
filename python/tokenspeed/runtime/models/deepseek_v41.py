@@ -87,7 +87,7 @@ from torch import nn
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_reduce, token_all_gather
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -952,6 +952,8 @@ class DeepseekV41Attention(nn.Module):
 class DeepseekV41MoE(DeepseekV4MoE):
     """V4 expert execution with V4.1 routing and lossless MegaMoE alignment."""
 
+    supports_scattered_attention_tp = True
+
     def __init__(self, config, mapping, quant_config, layer_index, prefix, aux_stream):
         expert_config = config
         padded = (
@@ -1146,22 +1148,41 @@ class DeepseekV41DecoderLayer(nn.Module):
                 for tensor in (ffn_pre, post, comb):
                     tensor.record_stream(consumer)
             x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
-            if self.ffn.use_mega_moe:
-                counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
-                x = self.ffn(
-                    x,
-                    image_mask,
-                    sum(counts),
-                    max(counts),
-                    ctx=ctx,
-                    comm_manager=self.comm_manager,
-                )
-            else:
-                x = self.comm_manager.pre_mlp_comm(x, ctx)
-                total, maximum = self.comm_manager.get_num_tokens(ctx)
-                x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
-                x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
+            x = self._forward_ffn(x, image_mask, ctx)
         return v41_hc_post(x, residual, post, comb), ffn_pre
+
+    def _forward_ffn(self, x, image_mask, ctx):
+        """Execute experts with one scattered token partition per attention rank."""
+        if self.ffn.use_mega_moe:
+            counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
+            return self.ffn(
+                x,
+                image_mask,
+                sum(counts),
+                max(counts),
+                ctx=ctx,
+                comm_manager=self.comm_manager,
+            )
+        mapping = self.comm_manager.mapping
+        scatter = mapping.attn.tp_size > 1 and not self.comm_manager.use_all_reduce(
+            is_moe=True
+        )
+        counts = self.comm_manager.attn_tp_group_scattered_num_tokens(ctx)
+        if scatter:
+            begin = sum(counts[: mapping.attn.tp_rank])
+            end = begin + counts[mapping.attn.tp_rank]
+            x = x[begin:end]
+        if image_mask is not None and mapping.attn.has_dp:
+            raise ValueError("V4.1 attention DP currently requires text-only requests")
+        x = self.comm_manager.pre_mlp_comm(x, ctx)
+        total, maximum = self.comm_manager.get_num_tokens(ctx)
+        x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
+        x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
+        if scatter:
+            x = token_all_gather(
+                x, group=mapping.attn.tp_group, scattered_num_tokens=counts
+            )
+        return x
 
 
 def _ced_decoder_start(config) -> int:
@@ -1345,7 +1366,8 @@ class DeepseekV41Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # The decoder view keeps at most a prompt's last window per extend
         # request (and one row per decode request), which bounds the rows the
-        # decoder stage can see for a given request count.
+        # decoder stage captures for ordinary generation. Input scoring may
+        # retain more rows and uses the existing above-capacity eager fallback.
         self.max_decoder_rows_per_request = int(config.sliding_window)
         # Engram history only travels past the narrowing while a decoder
         # layer still reads it.
@@ -1383,10 +1405,18 @@ class DeepseekV41Model(nn.Module):
         forward; the prefill graph calls them individually.
         """
         if input_ids.numel() == 0:
-            return (
-                self.embed_tokens.weight.new_empty((0, self.config.hidden_size)),
-                None,
-            )
+            # Empty DP replicas must still join each cross-replica MoE collective.
+            empty = self.embed_tokens.weight.new_empty((0, self.config.hidden_size))
+            if ctx.global_num_tokens is not None:
+                for layer in self.layers:
+                    counts = (
+                        ctx.global_num_tokens
+                        if layer.layer_id < self.ced_decoder_start
+                        else ctx.global_decoder_num_tokens
+                    )
+                    with report_collective_sizing(ctx, 0, counts):
+                        layer._forward_ffn(empty, None, ctx)
+            return empty, None
         state = self.encoder_forward(
             input_ids,
             positions,
@@ -1492,13 +1522,21 @@ class DeepseekV41Model(nn.Module):
         view = backend.decoder_view()
         # Checked here, in the stage that always runs eagerly: a replayed
         # encoder graph would skip a check placed before it.
-        if view.keep_rows is not None and ctx.global_num_tokens is not None:
-            raise NotImplementedError(
-                "V4.1 CED narrowing under attention data parallelism needs the "
-                "narrowed row counts exchanged across ranks"
-            )
+        if (
+            ctx.num_extends
+            and ctx.global_num_tokens is not None
+            and ctx.global_decoder_num_tokens is None
+        ):
+            raise RuntimeError("V4.1 DP requires decoder token counts")
+        decoder_counts = (
+            ctx.global_num_tokens
+            if ctx.all_decode_or_idle
+            else ctx.global_decoder_num_tokens
+        )
         captured = list(state.captured)
-        with report_collective_sizing(ctx, view.metadata.positions.numel(), None):
+        with report_collective_sizing(
+            ctx, view.metadata.positions.numel(), decoder_counts
+        ):
             hidden, pre_mix = self._run_layer(
                 self.layers[start], state.hidden, state.pre_mix, state, ctx, captured
             )
@@ -1538,7 +1576,12 @@ class DeepseekV41Model(nn.Module):
         h, pre_mix = state.hidden, state.pre_mix
         layers = self.layers[start + 1 :]
         if layers:
-            with report_collective_sizing(ctx, state.rows, None):
+            decoder_counts = (
+                ctx.global_num_tokens
+                if ctx.all_decode_or_idle
+                else ctx.global_decoder_num_tokens
+            )
+            with report_collective_sizing(ctx, state.rows, decoder_counts):
                 for layer in layers:
                     h, pre_mix = self._run_layer(
                         layer, h, pre_mix, state, ctx, captured

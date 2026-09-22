@@ -55,9 +55,10 @@ class _FakeLoop:
     """Only the state read by ``EventLoop._dp_sync_and_check``."""
 
     def __init__(self, *, world_size=1):
-        self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-        self._dp_global_info = torch.zeros(world_size, 3, dtype=torch.int32)
+        self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+        self._dp_global_info = torch.zeros(world_size, 4, dtype=torch.int32)
         self.world_cpu_group = None
+        self._prefill_decoder_window = None
 
 
 def _sync(loop, forward_op, monkeypatch, other_rank_rows=()):
@@ -67,7 +68,7 @@ def _sync(loop, forward_op, monkeypatch, other_rank_rows=()):
     def fake_gather(global_info, local_info, group=None):
         global_info[0] = local_info[0]
         for i, row in enumerate(other_rank_rows, start=1):
-            global_info[i] = torch.tensor(row, dtype=torch.int32)
+            global_info[i] = torch.tensor((*row, row[0]), dtype=torch.int32)
 
     monkeypatch.setattr(torch.distributed, "all_gather_single", fake_gather)
     return EventLoop._dp_sync_and_check(loop, forward_op)

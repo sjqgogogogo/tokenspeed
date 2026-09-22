@@ -590,6 +590,12 @@ class RequestHandler:
             self.max_req_len - len(req_state.prompt_input_ids) - 1,
         )
         req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
+        # KV hits do not contain prompt scores. Preserve global caching and
+        # other requests while this request recomputes its input, even on retry
+        # after scheduler retraction. The scheduler owns both L1/L2 matching.
+        req_spec.reuse_prefix_cache = not (
+            req_state.return_logprob and req_state.logprob_start_len >= 0
+        )
         return (
             req_spec,
             req_state,

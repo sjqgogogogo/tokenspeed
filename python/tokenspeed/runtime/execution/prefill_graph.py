@@ -389,6 +389,11 @@ class PrefillGraph:
             else None
         )
 
+        self.decoder_window = (
+            None
+            if self._narrowing is None
+            else self._narrowing.max_decoder_rows_per_request
+        )
         self.capture_buckets = get_prefill_token_buckets(config)
         self.disable = (
             config.enforce_eager
@@ -902,6 +907,12 @@ class PrefillGraph:
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
             ctx.global_bs = [bs] * self.config.world_size
+            decoder_tokens = (
+                num_tokens
+                if self.decoder_window is None
+                else sum(min(length, self.decoder_window) for length in seq_lens)
+            )
+            ctx.global_decoder_num_tokens = [decoder_tokens] * self.config.world_size
         # Every backend gets the same kwargs; V4 reads num_tokens/positions
         # for its packed rows, the others absorb them via **kwargs.
         extra_metadata_kwargs: dict = {
