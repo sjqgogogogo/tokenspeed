@@ -5,6 +5,11 @@ torchvision==0.29.0+cu126
 cuda-toolkit==12.6.3
 cuda-python==12.9.7
 cuda-bindings==12.9.7
+# Frontend 1.29+ requires CuTe's cu13 extra; FlashInfer 0.7 requires 1.29+.
+# Keep these aligned with the cu129 metadata in tokenspeed-kernel/python/setup.py.
+flashinfer-python==0.6.18
+flashinfer-cubin==0.6.18
+nvidia-cudnn-frontend==1.28.0
 tokenspeed-mooncake==0.3.13.post20260825
 nvidia-cutlass-dsl-libs-cu13<0
 nvidia-cublas<0

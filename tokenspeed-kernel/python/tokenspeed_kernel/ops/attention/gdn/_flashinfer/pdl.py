@@ -149,10 +149,14 @@ def _adapt_module(module, *, kernels, launchers, entrypoints, caches, overrides)
     without dependency synchronization after an incompatible FlashInfer update.
     """
     namespace = dict(vars(module))
-    namespace["build_and_load_cute_dsl_kernel"] = functools.partial(
-        _build_and_load_pdl_kernel,
-        original_builder=module.build_and_load_cute_dsl_kernel,
-    )
+    # FlashInfer 0.6.18 (cu129) has only the isolated in-memory caches below.
+    # 0.7 also persists artifacts, which need a distinct PDL namespace.
+    original_builder = namespace.get("build_and_load_cute_dsl_kernel")
+    if original_builder is not None:
+        namespace["build_and_load_cute_dsl_kernel"] = functools.partial(
+            _build_and_load_pdl_kernel,
+            original_builder=original_builder,
+        )
     namespace.update(overrides)
     for name in kernels:
         namespace[name] = _PdlKernel(getattr(module, name))

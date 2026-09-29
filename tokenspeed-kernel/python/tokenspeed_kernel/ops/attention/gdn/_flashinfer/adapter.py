@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 
 import torch
 from flashinfer.gdn_decode import (
@@ -33,6 +34,27 @@ from flashinfer.gdn_kernels.gdn_decode_mtp import (
     get_vec_size_mtp,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule as _original_prefill
+
+
+@functools.cache
+def _accepts_backend(function):
+    return "backend" in inspect.signature(function).parameters
+
+
+def _backend_kwargs(function, kwargs):
+    """Translate explicit CuTe selection for FlashInfer 0.6's single backend.
+
+    The cu129 recipe uses 0.6.18, which has no backend keyword. Its sole
+    implementation is the one named 'flashinfer' in 0.7. Reject other choices
+    instead of silently dropping a requested algorithm.
+    """
+    if "backend" in kwargs and not _accepts_backend(function):
+        if kwargs["backend"] != "flashinfer":
+            raise ValueError(
+                "This FlashInfer version only supports backend='flashinfer'"
+            )
+        return {key: value for key, value in kwargs.items() if key != "backend"}
+    return kwargs
 
 
 def gated_delta_rule_mtp(
@@ -292,7 +314,7 @@ def gated_delta_rule_decode_pretranspose(*, enable_pdl: bool, **kwargs):
     contains the upstream decode inputs, state pool/indices and output options.
     Returns the upstream ``(output, state)`` pair with K-last state layout.
     """
-    return _decode_runner(enable_pdl)(**kwargs)
+    return _decode_runner(enable_pdl)(**_backend_kwargs(_original_decode, kwargs))
 
 
 def gated_delta_rule_bf16_mtp(*, enable_pdl: bool, **kwargs):
@@ -313,4 +335,6 @@ def chunk_gated_delta_rule(*args, enable_pdl: bool, **kwargs):
     ``enable_pdl`` controls the persistent kernel. Returns the upstream output
     and optional final state.
     """
-    return _prefill_runner(enable_pdl)(*args, **kwargs)
+    return _prefill_runner(enable_pdl)(
+        *args, **_backend_kwargs(_original_prefill, kwargs)
+    )

@@ -39,9 +39,10 @@ installs the core backend file before compiling. Third-party dependencies are
 installed by the outer package installer from the generated metadata. They are
 not optional despite being kept in a separate file.
 
-TOKENSPEED_KERNEL_CUDA_VARIANT=cu129 selects CUDA 12 CuTe metadata and omits
-CUDA-13-only KDA AOT. The outer installer supplies these dependencies, so the
-cu129 build skips the nested pip install.
+TOKENSPEED_KERNEL_CUDA_VARIANT=cu129 selects CUDA 12 CuTe metadata and a
+compatible FlashInfer/cuDNN frontend pair, and omits CUDA-13-only KDA AOT.
+The outer installer supplies these dependencies, so the cu129 build skips
+the nested pip install.
 
 Kernel compilation
 ==================
@@ -263,15 +264,21 @@ def _selected_install_requires() -> list[str]:
     )
 
     # The cu129 source recipe supplies CUDA 12 dependencies before building.
-    # Keep all checkout pins, replacing only the CUDA-specific CuTe runtime.
+    # Frontend 1.29 requires cutlass-dsl[cu13] unconditionally; FlashInfer
+    # 0.7 requires that frontend. Keep a compatible pair for CUDA 12, in
+    # the package metadata as well as the outer installer's requirements.
     if (
         backend == "cuda"
         and os.environ.get("TOKENSPEED_KERNEL_CUDA_VARIANT") == "cu129"
     ):
+        cu129_pins = {
+            "flashinfer-python": "flashinfer-python==0.6.18",
+            "nvidia-cudnn-frontend": "nvidia-cudnn-frontend==1.28.0",
+        }
         requirements = [
-            requirement.replace(
-                "nvidia-cutlass-dsl[cu13]", "nvidia-cutlass-dsl"
-            ).replace("nvidia-cutlass-dsl-libs-cu13", "nvidia-cutlass-dsl-libs-cu12")
+            cu129_pins.get(requirement.split("==")[0], requirement)
+            .replace("nvidia-cutlass-dsl[cu13]", "nvidia-cutlass-dsl")
+            .replace("nvidia-cutlass-dsl-libs-cu13", "nvidia-cutlass-dsl-libs-cu12")
             for requirement in requirements
             if not requirement.startswith("tokenspeed-cutedsl-kda==")
         ]

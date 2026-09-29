@@ -58,8 +58,15 @@ torchvision `0.29.0+cu126` from the PyTorch cu126 index because this Torch relea
 has no cu129 wheels. Its Python CUDA runtime packages use CUDA 12.6.3, while
 `CUDA_HOME` and the native kernel compiler remain on CUDA Toolkit 12.9.
 Native TokenSpeed wheels still come from the LightSeek cu129 index.
-It uses the existing checkout's kernel versions, switches the CuTe runtime
-to cu12, and omits the CUDA-13-only CuteDSL KDA AOT package.
+It switches the CuTe runtime to cu12 and omits the CUDA-13-only CuteDSL KDA
+AOT package. The cu129 metadata selects FlashInfer Python/cubin `0.6.18`
+and cuDNN Frontend `1.28.0`: Frontend `1.29.0` unconditionally requires
+`nvidia-cutlass-dsl[cu13]`, and FlashInfer `0.7.0` requires Frontend >=1.29.
+Changing only the direct CuTe dependency cannot resolve that transitive
+conflict. Keep the cu13 exclusions; do not bypass resolution with `--no-deps`.
+The kernel package records the same cu129 pins, so the final runtime install
+does not restore the incompatible pair. Other checkout pins stay unchanged;
+the default CUDA 13 installation retains FlashInfer `0.7.0` / Frontend `1.29.0`.
 `requirements/nvidia-cu129-constraints.txt` contains the additional version
 constraints. Each installation step selects its package index explicitly;
 global pip configuration, environment-supplied requirements files, and extra package indexes are excluded so native
@@ -101,3 +108,17 @@ tokenspeed serve --help
 
 Dependency checks alone do not validate binary ABI compatibility or model
 serving correctness.
+
+The FlashInfer GDN adapter also supports the cu129 `0.6.18` API: explicit
+`backend="flashinfer"` selects its sole backend, and PDL isolates its
+in-memory caches without requiring the persistent-cache builder introduced
+in `0.7`. Other backend requests are rejected on the older API. GPU kernel
+and serving tests are still required for this dependency combination.
+
+CPU metadata and adapter-protocol regression tests:
+
+```bash
+python -m pytest test/ci_system/test_cu129_dependencies.py \
+    test/ci_system/test_flashinfer_legacy_adapter.py \
+    test/ci_system/test_cuda_install_validation.py
+```
