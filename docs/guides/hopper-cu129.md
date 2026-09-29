@@ -31,6 +31,33 @@ files, and required runtime libraries. The recipe does not run apt or sudo.
 Each pip call uses the active Python interpreter; proxy environment variables
 are inherited.
 
+The recipe also validates `$CUDA_HOME/bin/ptxas` and any explicit
+`TRITON_PTXAS_PATH` / `TRITON_PTXAS_BLACKWELL_PATH` overrides. After all pip
+operations it copies that CUDA 12.9 assembler into both bundled assembler
+slots of the active venv's `tokenspeed-triton` wheel. Triton can select
+`ptxas-blackwell` on Hopper; setting `CUDA_HOME` alone does not select its
+assembler. A fresh Python process verifies the actual SM90 selection.
+Only paths inside the active venv may be replaced; external/shared installs
+are rejected. Subsequent Triton reinstalls can replace these files again.
+
+An already installed environment can repair just these assembler slots,
+without rerunning pip or rebuilding TokenSpeed:
+
+```bash
+python test/ci_system/install_deps_cu129.py --configure-triton-only
+```
+
+When investigating a binary-load failure after a toolchain change, test in
+a fresh process with a new cache directory instead of deleting shared caches:
+
+```bash
+export TRITON_CACHE_DIR="$(mktemp -d /tmp/tokenspeed-cu129.XXXXXX)"
+```
+
+This aligns the assembler; it does not establish that every `loadBinary`
+failure is an assembler mismatch. Driver compatibility and GPU execution
+still need validation on the target host.
+
 The helper rejects installed CUDA 13 runtime packages and Torch wheels marked
 cu13 before changing packages. It reports the conflicting distributions and
 leaves them installed. Use a fresh cu129 venv instead of mixing the two stacks;
@@ -119,6 +146,7 @@ CPU metadata and adapter-protocol regression tests:
 
 ```bash
 python -m pytest test/ci_system/test_cu129_dependencies.py \
+    test/ci_system/test_cu129_ptxas.py \
     test/ci_system/test_flashinfer_legacy_adapter.py \
     test/ci_system/test_cuda_install_validation.py
 ```

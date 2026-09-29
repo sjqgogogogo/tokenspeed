@@ -103,6 +103,17 @@ def test_installer_uses_adjusted_requirements_and_matching_cubin(monkeypatch):
     monkeypatch.setattr(
         installer, "pip_install", lambda args, index: calls.append((args, index))
     )
+    tool_events = []
+    monkeypatch.setattr(
+        installer,
+        "configure_triton_ptxas",
+        lambda cuda_home: tool_events.append(("configure", len(calls))),
+    )
+    monkeypatch.setattr(
+        installer,
+        "verify_triton_ptxas",
+        lambda: tool_events.append(("verify", len(calls))),
+    )
     original_run = installer.subprocess.run
 
     def run(command, **kwargs):
@@ -111,7 +122,8 @@ def test_installer_uses_adjusted_requirements_and_matching_cubin(monkeypatch):
         return original_run(command, **kwargs)
 
     monkeypatch.setattr(installer.subprocess, "run", run)
-    installer.main()
+    installer.main(configure_triton_only=False)
+    assert tool_events == [("configure", len(calls)), ("verify", len(calls))]
     resolved = next(args for args, _ in calls if "flashinfer-python==0.6.18" in args)
     assert "nvidia-cudnn-frontend==1.28.0" in resolved
     assert "nvidia-cutlass-dsl==4.8.0" in resolved
