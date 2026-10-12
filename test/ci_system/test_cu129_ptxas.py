@@ -109,12 +109,15 @@ def test_bundled_assemblers_are_replaced_only_inside_venv(
 
 
 @pytest.mark.parametrize("version", ["12.9", "13.4"])
-def test_sm90_assembler_verification_in_fresh_process(monkeypatch, tmp_path, version):
+@pytest.mark.parametrize("selector", ["get_ptxas_for_arch", "get_ptxas"])
+def test_sm90_assembler_verification_in_fresh_process(
+    monkeypatch, tmp_path, version, selector
+):
     package = tmp_path / "tokenspeed_triton/backends/nvidia"
     package.mkdir(parents=True)
     (package / "compiler.py").write_text(
         "from types import SimpleNamespace\n"
-        "def get_ptxas_for_arch(arch):\n"
+        f"def {selector}(arch):\n"
         "    assert arch == 90\n"
         f"    return SimpleNamespace(path='/fake/ptxas-blackwell', version={version!r})\n"
     )
@@ -125,6 +128,16 @@ def test_sm90_assembler_verification_in_fresh_process(monkeypatch, tmp_path, ver
     else:
         with pytest.raises(subprocess.CalledProcessError):
             installer.verify_triton_ptxas()
+
+
+def test_unknown_assembler_selection_api_fails(monkeypatch, tmp_path):
+    package = tmp_path / "tokenspeed_triton/backends/nvidia"
+    package.mkdir(parents=True)
+    (package / "compiler.py").write_text("")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(subprocess.CalledProcessError):
+        installer.verify_triton_ptxas()
 
 
 @pytest.mark.parametrize(

@@ -39,6 +39,8 @@ venv's `tokenspeed-triton`. Wheels shipping only `ptxas` are supported.
 Triton can select `ptxas-blackwell` on Hopper; setting `CUDA_HOME` alone does
 not select its assembler. A fresh Python process verifies the actual SM90
 selection and still rejects any version other than CUDA 12.9.
+The verifier supports both `get_ptxas` and `get_ptxas_for_arch` compiler
+interfaces; an unknown selection API fails rather than skipping verification.
 Only paths inside the active venv may be replaced; external/shared installs
 are rejected. Subsequent Triton reinstalls can replace these files again.
 

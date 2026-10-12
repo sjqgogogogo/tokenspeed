@@ -117,9 +117,13 @@ def verify_triton_ptxas() -> None:
         [
             sys.executable,
             "-c",
-            "from tokenspeed_triton.backends.nvidia.compiler "
-            "import get_ptxas_for_arch\n"
-            "tool = get_ptxas_for_arch(90)\n"
+            "from tokenspeed_triton.backends.nvidia import compiler\n"
+            "selector = getattr(compiler, 'get_ptxas', None)\n"
+            "if selector is None:\n"
+            "    selector = getattr(compiler, 'get_ptxas_for_arch', None)\n"
+            "if selector is None:\n"
+            "    raise RuntimeError('Unsupported tokenspeed-triton ptxas selection API')\n"
+            "tool = selector(90)\n"
             "print(f'Hopper Triton ptxas: {tool.path}, CUDA {tool.version}', flush=True)\n"
             "if tool.version != '12.9':\n"
             "    raise RuntimeError('Hopper/cu129 requires Triton ptxas 12.9')\n",
