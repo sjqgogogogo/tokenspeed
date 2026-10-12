@@ -5734,8 +5734,8 @@ _CASES = [
         _moe_apply_mxfp4_triton,
     ),
     _case(
-        _is_supported_gpu,
-        "supported-gpu",
+        _is_hopper_plus,
+        "hopper-plus",
         "moe",
         "apply",
         "triton_bf16_precomputed_moe_apply",

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -210,6 +211,7 @@ def _validate(
 
 @triton.jit
 def _stage1_kernel(
+    x_ptr,
     x_desc,
     w13_desc,
     inter_ptr,
@@ -224,6 +226,7 @@ def _stage1_kernel(
     situ_linear_beta,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    USE_TMA_GATHER: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -256,7 +259,19 @@ def _stage1_kernel(
             up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
             for k_offset in range(0, hidden_size, BLOCK_K):
-                x = x_desc.gather(token_ids, k_offset)
+                if USE_TMA_GATHER:
+                    x = x_desc.gather(token_ids, k_offset)
+                else:
+                    # Hopper supports TMA loads, but descriptor gather emits
+                    # gather4 instructions that require SM100 or newer.
+                    x = tl.load(
+                        x_ptr
+                        + token_ids[:, None] * hidden_size
+                        + k_offset
+                        + tl.arange(0, BLOCK_K)[None, :],
+                        mask=row_mask[:, None],
+                        other=0.0,
+                    )
                 gate = w13_desc.load([expert_id, n_offset, k_offset]).reshape(
                     (BLOCK_N, BLOCK_K)
                 )
@@ -267,14 +282,16 @@ def _stage1_kernel(
                 up_acc += tl.dot(x, up.T)
 
             if ACTIVATION == "situ":
-                gate = gate_acc.to(x_desc.dtype).to(tl.float32)
-                up = up_acc.to(x_desc.dtype).to(tl.float32)
+                gate = gate_acc.to(x_ptr.dtype.element_ty).to(tl.float32)
+                up = up_acc.to(x_ptr.dtype.element_ty).to(tl.float32)
                 gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
                 if HAS_LINEAR_BETA:
                     up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
-                activated = (gate * up).to(x_desc.dtype)
+                activated = (gate * up).to(x_ptr.dtype.element_ty)
             else:
-                activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(x_desc.dtype)
+                activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(
+                    x_ptr.dtype.element_ty
+                )
             inter_offsets = (
                 route_ids[:, None] * intermediate_size
                 + n_offset
@@ -393,11 +410,13 @@ def _moe(
     stage2_programs = min(
         num_sms, route_count * triton.cdiv(hidden_size, stage2_block_n)
     )
-    x_desc = TensorDescriptor.from_tensor(x, [1, block_k])
+    use_tma_gather = torch.cuda.get_device_capability(x.device)[0] >= 10
+    x_desc = TensorDescriptor.from_tensor(x, [1, block_k]) if use_tma_gather else None
     w13_desc = TensorDescriptor.from_tensor(w13, [1, stage1_block_n, block_k])
     w2_desc = TensorDescriptor.from_tensor(w2, [1, stage2_block_n, block_k])
 
     _stage1_kernel[(stage1_programs,)](
+        x,
         x_desc,
         w13_desc,
         intermediate,
@@ -412,6 +431,7 @@ def _moe(
         situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
         ACTIVATION=activation,
         HAS_LINEAR_BETA=situ_linear_beta is not None,
+        USE_TMA_GATHER=use_tma_gather,
         NUM_PROGRAMS=stage1_programs,
         BLOCK_M=block_m,
         BLOCK_N=stage1_block_n,
@@ -451,6 +471,9 @@ def _moe(
     "apply",
     name="triton_bf16_precomputed_moe_apply",
     solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}), min_arch_version=ArchVersion(9, 0)
+    ),
     signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
     traits={
         "weight_dtype": frozenset({"unquant"}),

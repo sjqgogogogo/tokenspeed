@@ -140,6 +140,14 @@ tokenspeed serve --help
 Dependency checks alone do not validate binary ABI compatibility or model
 serving correctness.
 
+For BF16 models with `--moe-backend triton` and EP1, the expert GEMM uses
+masked indexed input loads on Hopper. Descriptor gather requires SM100+ and
+remains enabled only on those architectures; ordinary TMA weight loads are
+used on both. The corresponding GPU regression test is
+`tokenspeed-kernel/test/nvidia/test_triton_bf16_apply.py`. It exercises small
+and larger batches, partial tiles, repeated routes and invalid expert IDs.
+This path does not claim batch-invariant arithmetic.
+
 The FlashInfer GDN adapter also supports the cu129 `0.6.18` API: explicit
 `backend="flashinfer"` selects its sole backend, and PDL isolates its
 in-memory caches without requiring the persistent-cache builder introduced
