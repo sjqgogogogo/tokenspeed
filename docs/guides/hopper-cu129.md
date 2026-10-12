@@ -33,10 +33,12 @@ are inherited.
 
 The recipe also validates `$CUDA_HOME/bin/ptxas` and any explicit
 `TRITON_PTXAS_PATH` / `TRITON_PTXAS_BLACKWELL_PATH` overrides. After all pip
-operations it copies that CUDA 12.9 assembler into both bundled assembler
-slots of the active venv's `tokenspeed-triton` wheel. Triton can select
-`ptxas-blackwell` on Hopper; setting `CUDA_HOME` alone does not select its
-assembler. A fresh Python process verifies the actual SM90 selection.
+operations it copies that CUDA 12.9 assembler into the bundled `ptxas` slot
+and, when shipped by the wheel, the `ptxas-blackwell` slot of the active
+venv's `tokenspeed-triton`. Wheels shipping only `ptxas` are supported.
+Triton can select `ptxas-blackwell` on Hopper; setting `CUDA_HOME` alone does
+not select its assembler. A fresh Python process verifies the actual SM90
+selection and still rejects any version other than CUDA 12.9.
 Only paths inside the active venv may be replaced; external/shared installs
 are rejected. Subsequent Triton reinstalls can replace these files again.
 

@@ -74,10 +74,12 @@ def validate_cuda129_tool(tool: Path) -> None:
 def configure_triton_ptxas(cuda_home: Path) -> None:
     """Persist CUDA 12.9 assemblers in this venv's tokenspeed-triton wheel.
 
-    Newer Triton selects ptxas-blackwell for sm90 as well as Blackwell.
+    Some Triton wheels select ptxas-blackwell for sm90 as well as Blackwell;
+    others ship only ptxas.
     CUDA_HOME does not override that bundled tool, and installer environment
-    variables do not survive into subsequent serving processes. Replace both
-    bundled entry points after all pip operations so upgrades cannot undo it.
+    variables do not survive into subsequent serving processes. Replace the
+    bundled entry points present after all pip operations so upgrades cannot
+    undo it. The fresh-process check verifies the actual sm90 selection.
     Only the active venv's wheel files may be changed; editable/shared installs
     outside it are rejected.
     """
@@ -89,6 +91,8 @@ def configure_triton_ptxas(cuda_home: Path) -> None:
     for name in ("ptxas", "ptxas-blackwell"):
         relative = f"tokenspeed_triton/backends/nvidia/bin/{name}"
         if relative not in files:
+            if name == "ptxas-blackwell":
+                continue
             raise RuntimeError(f"tokenspeed-triton wheel is missing {relative}")
         path = Path(distribution.locate_file(relative))
         # Resolve the parent, not the file: replace a previous symlink without

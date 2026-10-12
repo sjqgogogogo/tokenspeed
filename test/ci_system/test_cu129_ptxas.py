@@ -51,7 +51,9 @@ def test_toolkit_version_validation(monkeypatch, version):
             installer.validate_cuda129_tool(tool)
 
 
-@pytest.mark.parametrize("layout", ["regular", "symlink", "outside", "missing"])
+@pytest.mark.parametrize(
+    "layout", ["regular", "single", "symlink", "outside", "missing"]
+)
 def test_bundled_assemblers_are_replaced_only_inside_venv(
     monkeypatch, tmp_path, layout
 ):
@@ -70,6 +72,8 @@ def test_bundled_assemblers_are_replaced_only_inside_venv(
         Path("tokenspeed_triton/backends/nvidia/bin") / name
         for name in ("ptxas", "ptxas-blackwell")
     ]
+    if layout == "single":
+        relatives = relatives[:1]
     for relative in relatives:
         target = site / relative
         if layout == "symlink":
@@ -78,7 +82,7 @@ def test_bundled_assemblers_are_replaced_only_inside_venv(
             target.write_text("CUDA 13 assembler")
     monkeypatch.setattr(installer.sys, "prefix", str(venv))
     distribution = SimpleNamespace(
-        files=relatives[:1] if layout == "missing" else relatives,
+        files=relatives[1:] if layout == "missing" else relatives,
         locate_file=lambda relative: (
             tmp_path / "outside" / relative if layout == "outside" else site / relative
         ),
@@ -100,6 +104,8 @@ def test_bundled_assemblers_are_replaced_only_inside_venv(
             assert target.read_bytes() == source.read_bytes()
             assert os.access(target, os.X_OK)
         assert external.read_text() == "external assembler"
+        if layout == "single":
+            assert not (tools / "ptxas-blackwell").exists()
 
 
 @pytest.mark.parametrize("version", ["12.9", "13.4"])
