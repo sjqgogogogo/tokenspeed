@@ -128,8 +128,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         # future. Target verify and ordinary decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
 
-        backend_name = spec.backend_name or "mla"
-        self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
+        self.kernel_solution = self.resolve_kernel_solution(spec.backend_name or "mla")
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
@@ -137,6 +136,15 @@ class MLAAttnBackend(PagedAttentionBackend):
         self._query_block_decode: dict[tuple[int, int, bool], bool] = {}
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
+
+    @classmethod
+    def resolve_kernel_solution(cls, backend_name: str) -> str | None:
+        """Map backend identity to its kernel solution.
+
+        Plugin leaves can override this mapping while retaining their original
+        MLA spec and the shared metadata/cache lifecycle.
+        """
+        return {"mla": None, "gluon": "gluon"}[backend_name]
 
     def _takes_query_blocks(
         self, num_q_heads: int, q_len: int, sliding_window: bool

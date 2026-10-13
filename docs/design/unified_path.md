@@ -1178,3 +1178,13 @@ mapping remains a separate consumer of the shared mapping helpers
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
   capture is inherited from the base default (idle refresh). Only a
   kernel-imposed capture asymmetry justifies an override.
+
+### MLA plugin kernel selection
+
+`MLAAttnBackend.resolve_kernel_solution(backend_name)` maps a registered backend
+identity to its kernel solution. An out-of-tree MLA leaf can override the mapping
+while reusing the shared metadata construction, cache binding and persistent
+refresh buffers. It should pass its original attention spec through construction;
+it need not masquerade as an in-tree backend merely to reuse those buffers.
+The built-in `mla` and `gluon` mappings are unchanged. This hook selects no new
+arithmetic and does not replace the leaf's execution or capability contract.
