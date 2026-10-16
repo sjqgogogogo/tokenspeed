@@ -26,7 +26,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -360,7 +360,9 @@ def select_dsa_prefill_topk_for_rows(
     ).name
 
 
-def _slot_order_kwargs(kernel, slot_order: str, *, role: str) -> dict:
+def _slot_order_kwargs(
+    kernel, slot_order: str, *, role: str, kernel_plan: KernelPlan | None = None
+) -> dict:
     """The ``slot_order`` kwarg for a selected leaf or core, refusing what it cannot do.
 
     A kernel declaring the trait was already matched on it and takes the
@@ -372,7 +374,11 @@ def _slot_order_kwargs(kernel, slot_order: str, *, role: str) -> dict:
         raise ValueError(
             f"slot_order must be one of {list(SLOT_ORDERS)}, got {slot_order!r}"
         )
-    spec = KernelRegistry.get().get_by_name(kernel.name)
+    spec = (
+        kernel_plan.spec
+        if kernel_plan is not None
+        else KernelRegistry.get().get_by_name(kernel.name)
+    )
     declared = None if spec is None else spec.traits.get("slot_order")
     if declared is None:
         if slot_order == "sorted":
@@ -417,6 +423,7 @@ def dsa_decode(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    kernel_plan: KernelPlan | None = None,
 ) -> AttentionResult:
     """Sparse DSA decode over selected global KV slots.
 
@@ -446,6 +453,7 @@ def dsa_decode(
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        kernel_plan: Initialization-time choice; inputs are validated without reselection.
         slot_order: The order the selected slots are reduced in, one of
             ``SLOT_ORDERS``: ``"selection"`` (as the top-k leaf emitted them;
             every kernel) or ``"sorted"`` (the ascending position order the
@@ -482,15 +490,29 @@ def dsa_decode(
         "slot_order": slot_order,
     }
     signature = _attention_format_signature(q=q)
-    kernel = select_kernel(
-        "attention",
-        "dsa_decode",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
+    if kernel_plan is not None:
+        kernel_plan.validate(
+            "attention",
+            "dsa_decode",
+            signature,
+            traits=traits,
+            features=None,
+            solution=solution,
+            override=override,
+        )
+        kernel = kernel_plan.kernel
+    else:
+        kernel = select_kernel(
+            "attention",
+            "dsa_decode",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    slot_order_kwargs = _slot_order_kwargs(
+        kernel, slot_order, role="core", kernel_plan=kernel_plan
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
     shape_params = {
         "batch_size": batch_size,
         "q_len": q_len,
@@ -551,6 +573,7 @@ def dsa_prefill(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    kernel_plan: KernelPlan | None = None,
 ) -> AttentionResult:
     """Sparse DSA prefill over selected global KV slots.
 
@@ -578,6 +601,7 @@ def dsa_prefill(
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        kernel_plan: Initialization-time choice; inputs are validated without reselection.
         slot_order: The order the selected slots are reduced in, as for
             :func:`dsa_decode`. Required keyword.
 
@@ -607,15 +631,29 @@ def dsa_prefill(
         "slot_order": slot_order,
     }
     signature = _attention_format_signature(q=q)
-    kernel = select_kernel(
-        "attention",
-        "dsa_prefill",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
+    if kernel_plan is not None:
+        kernel_plan.validate(
+            "attention",
+            "dsa_prefill",
+            signature,
+            traits=traits,
+            features=None,
+            solution=solution,
+            override=override,
+        )
+        kernel = kernel_plan.kernel
+    else:
+        kernel = select_kernel(
+            "attention",
+            "dsa_prefill",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    slot_order_kwargs = _slot_order_kwargs(
+        kernel, slot_order, role="core", kernel_plan=kernel_plan
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
     shape_params = {
         "batch_size": batch_size,
         "q_len": q_len,

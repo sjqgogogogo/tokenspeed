@@ -30,7 +30,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
@@ -1228,14 +1228,36 @@ def _build_traits(
 
 
 def _select_moe_apply(
-    input_dtype: torch.dtype, traits: dict[str, Any], solution: str | None
+    input_dtype: torch.dtype,
+    traits: dict[str, Any],
+    solution: str | None,
+    features: frozenset[str],
 ):
+    signature = format_signature(x=dense_tensor_format(input_dtype))
+    if "batch_invariant" in features:
+        selected = KernelPlan.select(
+            "moe",
+            "apply",
+            signature,
+            features=features,
+            static_traits=traits,
+            variable_traits=frozenset({"m", "num_tokens", "batch_size"}),
+            solution=solution,
+            declared_traits=(
+                frozenset({"combine_order"})
+                if traits["combine_order"] == "slot"
+                else frozenset()
+            ),
+            ignore_layout=True,
+        )
+        return selected.kernel, selected.spec
     kernel = select_kernel(
         "moe",
         "apply",
-        format_signature(x=dense_tensor_format(input_dtype)),
+        signature,
         traits=traits,
         solution=solution,
+        features=features,
         ignore_layout=True,
     )
     apply_spec = KernelRegistry.get().get_by_name(kernel.name)
@@ -1275,6 +1297,7 @@ def moe_plan(
     persistent_max_num_tokens_per_gpu: int | None = None,
     fast_math: bool,
     combine_order: str,
+    features: frozenset[str] = frozenset(),
     solution: str | None = None,
     fp32_correction_bias: bool = False,
 ) -> dict:
@@ -1343,6 +1366,7 @@ def moe_plan(
             the caller must not reduce; it needs a kernel declaring the
             ``combine_order`` trait with ``"slot"`` and, for ``ep_size > 1``,
             the EP process group. Required keyword.
+        features: Required registered capabilities, e.g. batch_invariant.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
         fp32_correction_bias: Whether routing must add the DeepSeekV3
@@ -1398,7 +1422,7 @@ def moe_plan(
     )
     traits["persistent_workspace"] = persistent_max_num_tokens_per_gpu is not None
 
-    kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution)
+    kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution, features)
     # A kernel that routes from logits keeps an FP32 correction bias only if
     # its hook says so; TokenSpeed's top-k routers always add it in FP32.
     fp32_bias_hook = getattr(kernel.impl, "_tokenspeed_fp32_correction_bias", None)
@@ -1415,7 +1439,7 @@ def moe_plan(
             )
         _log_fp32_correction_bias_fallback(apply_spec.name)
         routing_mode = traits["routing_mode"] = "precomputed_topk"
-        kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution)
+        kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution, features)
     _validate_selected_deepep_mode(
         a2a_backend,
         deepep_mode,
@@ -1444,6 +1468,9 @@ def moe_plan(
         "weight_dtype": weight_dtype,
         "activation": activation,
         "apply_kernel_name": apply_spec.name,
+        "apply_kernel": kernel,
+        "input_dtype": input_dtype,
+        "features": features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
         "a2a_backend": a2a_backend,
@@ -1571,12 +1598,11 @@ def moe_apply(
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
     data = x[0] if isinstance(x, tuple) else x
-    kernel = select_kernel(
-        "moe",
-        "apply",
-        format_signature(x=dense_tensor_format(data.dtype)),
-        override=plan["apply_kernel_name"],
-    )
+    kernel = plan["apply_kernel"]
+    if "batch_invariant" in plan["features"] and data.dtype != plan["input_dtype"]:
+        raise ValueError(
+            "Batch-invariant MoE input dtype differs from its initialization plan"
+        )
     # Only the all-to-all EP kernels own dispatch/combine legs, so the mode
     # decision stays off the signature every other apply kernel implements.
     a2a_kwargs = (

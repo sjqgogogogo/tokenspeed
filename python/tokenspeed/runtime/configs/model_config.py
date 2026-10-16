@@ -467,6 +467,10 @@ def beam_default_moe_backend(
 def _apply_beam_moe_default(model_config, server_args: ServerArgs) -> None:
     """Fill ``--moe-backend`` for a Beam model the launch left ``auto`` (an
     explicit backend is never asked; another model's launch is not read)."""
+    from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+
+    if server_args.numerics in BITWISE_ENVELOPES:
+        return
     architectures = _model_architectures(
         model_config.hf_config, model_config.hf_text_config
     )
