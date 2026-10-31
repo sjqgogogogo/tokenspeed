@@ -234,6 +234,36 @@ the hidden size to be multiples of 128. Other widths, SiTU experts and DeepEP
 all-to-all layouts keep `marlin`. `--moe-mxfp4-fp8-activation` selects its
 W4A8 variant.
 
+### dots3-note replicated shared experts
+
+Set `--hf-overrides '{"shared_experts_strategy":"replicated_owned_rows"}'`
+to keep full shared-expert weights on each MoE rank while assigning disjoint
+token rows to those ranks. Each token's shared result is added to exactly one
+routed partial before the existing rank-combine collective. This preserves
+the routed-expert backend and EP layout without an extra shared-output
+collective. Uneven token counts, including ranks with no owned rows, are
+supported.
+
+This strategy requires `--all2all-backend none`, rank combine, `numerics=auto`,
+and a routed backend without deferred finalize. Other combinations fail
+explicitly. Omitting the override preserves shared-expert TP.
+
+The checkpoint's first dense FFN has an independent parallel layout. For
+example, attention TP8 with `--dense-tp-size 1`, MoE TP1 and EP8 keeps both
+the dense FFN and shared experts unsharded along their intermediate axes.
+The dense FFN uses the existing token reduce-scatter/all-gather transitions;
+it does not use the shared-expert ownership rule. This avoids FP8 block
+misalignment from eight-way intermediate sharding without padding weights.
+Idle MTP ranks skip the local embedding/hidden projection but still enter the
+draft decoder, preserving its communication contract without launching a
+zero-row FP8 GEMM.
+The MTP model keeps its own checkpoint embedding and shares the complete target
+LM head, including its quantization method and scales.
+The serialized FP8 checkpoint stores the LM head in BF16 without block scales.
+Its replicated DP head therefore keeps that native precision; the checkpoint's
+FP8 configuration still applies to the attention and FFN weights. Other
+quantization configurations retain their existing head policy.
+
 ### Kimi-K3 attention DP with MoE EP
 
 With `none`, `agrs`, or `flashinfer` transport and attention DP greater than one,

@@ -38,6 +38,7 @@ from tokenspeed.runtime.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from tokenspeed.runtime.models.dots3_note import (
     Dots3NoteAttention,
     Dots3NoteDecoderLayer,
+    resolve_dots3_note_lm_head,
 )
 from tokenspeed.runtime.utils import add_prefix
 
@@ -123,7 +124,9 @@ class Dots3NoteModelNextN(nn.Module):
 
     def forward(self, input_ids, positions, ctx, captured_hidden_states=None):
         if ctx.forward_mode.is_idle():
-            fused = self.enorm.weight.new_empty((0, 2 * self.hidden_size))
+            # Skip the local FP8 projection, whose backend can require M > 0,
+            # but still run the decoder so it honors its communication contract.
+            hidden_states = self.enorm.weight.new_empty((0, self.hidden_size))
         else:
             if captured_hidden_states is None:
                 raise ValueError("dots3-note MTP requires captured_hidden_states")
@@ -134,7 +137,7 @@ class Dots3NoteModelNextN(nn.Module):
                 ),
                 dim=-1,
             )
-        hidden_states = self.eh_proj(fused)[0]
+            hidden_states = self.eh_proj(fused)[0]
         hidden_states, residual = self.decoder(positions, hidden_states, ctx, None)
         if not ctx.forward_mode.is_idle():
             hidden_states, _ = self.decoder.comm_manager.final_norm(
@@ -145,6 +148,7 @@ class Dots3NoteModelNextN(nn.Module):
 
 class Dots3NoteForCausalLMNextN(BaseCausalLM):
     model_cls = Dots3NoteModelNextN
+    resolve_lm_head = resolve_dots3_note_lm_head
     forward = DeepseekV3ForCausalLMNextN.forward
     get_hot_token_id = DeepseekV3ForCausalLMNextN.get_hot_token_id
     post_load_weights = DeepseekV3ForCausalLMNextN.post_load_weights
@@ -155,6 +159,13 @@ class Dots3NoteForCausalLMNextN(BaseCausalLM):
     def set_embed_and_head(self, embed, head):
         # The checkpoint's MTP embedding differs from the target embedding.
         super().set_embed_and_head(self.model.embed_tokens.weight, head)
+
+    def set_embed_and_head_module(self, embed: torch.Tensor | None, lm_head: nn.Module):
+        """Keep the MTP embedding and alias the target's complete prepared head."""
+        # Sharing weight alone loses a quantized head's scales and method.
+        self.lm_head = lm_head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     def checkpoint_weight_name_filter(self, name):
         return name.startswith(

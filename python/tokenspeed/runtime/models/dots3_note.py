@@ -35,12 +35,14 @@ from torch import nn
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
 from tokenspeed.runtime.layers.layernorm import LayerNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -49,9 +51,11 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3DecoderLayer,
     DeepseekV3ForCausalLM,
@@ -62,6 +66,22 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+
+def resolve_dots3_note_lm_head(self, config, quant_config, prefix):
+    """Honor the BF16 head stored in the public block-FP8 checkpoint."""
+    head_quant_config = quant_config
+    if (
+        self.mapping.attn.has_dp
+        and not self.mapping.lm_head.has_tp
+        and type(quant_config) is Fp8Config
+        and quant_config.is_checkpoint_fp8_serialized
+    ):
+        # Only the replicated-head branch would otherwise create FP8 weights
+        # and scales for a BF16 tensor with no checkpoint scale. Keep all other
+        # components and the ordinary ParallelLMHead branch unchanged.
+        head_quant_config = None
+    return BaseCausalLM.resolve_lm_head(self, config, head_quant_config, prefix)
 
 
 class Dots3NoteIndexer(nn.Module):
@@ -398,6 +418,9 @@ class Dots3NoteAttention(nn.Module):
 
     @break_point
     def forward(self, positions, hidden_states, ctx, comm_manager, block_scale=None):
+        # A zero-row RSAG shard can acquire rows from its peers. Join the
+        # collective before deciding whether this rank has attention work.
+        hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
         if hidden_states.shape[0] == 0:
             return hidden_states
         with ctx.attn_backend.record_pd_cache_step(
@@ -408,7 +431,6 @@ class Dots3NoteAttention(nn.Module):
             )
 
     def _forward(self, positions, hidden_states, ctx, comm_manager, block_scale):
-        hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
         q_latent, latent = self.normalize_latents(
             self.q_a_proj(hidden_states)[0], self.kv_a_proj_with_mqa(hidden_states)[0]
         )
@@ -508,6 +530,110 @@ class Dots3NoteRouter(nn.Module):
         return F.linear(hidden_states.float(), self.weight.float())
 
 
+class Dots3NoteReplicatedSharedMLP(nn.Module):
+    """Full shared weights, with disjoint token rows assigned to each MoE rank."""
+
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        hidden_act,
+        quant_config,
+        prefix,
+        *,
+        owner_rank,
+        owner_size,
+    ):
+        super().__init__()
+        if hidden_act != "silu":
+            raise ValueError("dots3-note replicated shared experts require SiLU")
+        if owner_size < 1 or not 0 <= owner_rank < owner_size:
+            raise ValueError("Invalid dots3-note shared token owner")
+        self.owner_rank = owner_rank
+        self.owner_size = owner_size
+        self.hidden_size = hidden_size
+        parallel = dict(tp_rank=0, tp_size=1, tp_group=None)
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
+            **parallel,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            input_is_parallel=True,
+            reduce_results=False,
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
+            **parallel,
+        )
+        self.act_fn = SiluAndMul()
+
+    def owner_rows(self, num_tokens: int) -> slice:
+        rows, remainder = divmod(num_tokens, self.owner_size)
+        start = self.owner_rank * rows + min(self.owner_rank, remainder)
+        count = rows + int(self.owner_rank < remainder)
+        return slice(start, start + count)
+
+    def forward(self, hidden_states):
+        owned = hidden_states[self.owner_rows(hidden_states.shape[0])]
+        if owned.shape[0] == 0:
+            return None
+        gate_up = self.gate_up_proj(owned)[0]
+        return self.down_proj(self.act_fn(gate_up))[0]
+
+    def add_to_routed(self, routed_output, shared_output):
+        if routed_output.ndim != 2 or routed_output.shape[1] != self.hidden_size:
+            raise ValueError("Routed output must contain complete hidden rows")
+        owned_output = routed_output[self.owner_rows(routed_output.shape[0])]
+        if shared_output.shape != owned_output.shape:
+            raise ValueError("Shared output must match this rank's owned token rows")
+        # Only one rank contributes each complete shared row to the existing
+        # rank-combine collective. Other routed partial rows are unchanged.
+        owned_output.add_(shared_output)
+        return routed_output
+
+
+class Dots3NoteOwnedRowsMoE(DeepseekV3MoE):
+    """Keep the routed EP kernel and its rank sum, with replicated shared weights."""
+
+    def __init__(self, config, mapping, quant_config, layer_index, prefix, alt_stream):
+        if global_server_args_dict["moe_combine_order"] != "rank":
+            raise ValueError("replicated_owned_rows requires MoE rank combine")
+        if global_server_args_dict["all2all_backend"] != "none":
+            raise ValueError("replicated_owned_rows requires non-A2A MoE")
+        if global_server_args_dict["numerics"] != "auto":
+            raise ValueError("replicated_owned_rows supports only numerics=auto")
+        super().__init__(
+            config,
+            mapping,
+            quant_config,
+            layer_index=layer_index,
+            prefix=prefix,
+            alt_stream=alt_stream,
+        )
+        if self.experts.supports_deferred_finalize:
+            raise ValueError("replicated_owned_rows does not support deferred finalize")
+
+    def _make_shared_experts(self, config, quant_config, prefix):
+        return Dots3NoteReplicatedSharedMLP(
+            config.hidden_size,
+            config.moe_intermediate_size * config.n_shared_experts,
+            config.hidden_act,
+            quant_config,
+            add_prefix("shared_experts", prefix),
+            owner_rank=self.mapping.moe.tp_ep_rank,
+            owner_size=self.mapping.moe.tp_ep_size,
+        )
+
+    def _add_shared_expert_output(self, routed_output, shared_output):
+        return self.shared_experts.add_to_routed(routed_output, shared_output)
+
+
 class Dots3NoteDecoderLayer(DeepseekV3DecoderLayer):
     @property
     def attention_cls(self):
@@ -520,12 +646,18 @@ class Dots3NoteDecoderLayer(DeepseekV3DecoderLayer):
         self.mapping = mapping
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
+        shared_strategy = config.resolve_shared_experts_strategy()
         self.self_attn = self.attention_cls(
             config, mapping, layer_id, quant_config, add_prefix("self_attn", prefix)
         )
         self.is_moe_layer = self._is_moe_layer(layer_id, False, config)
         if self.is_moe_layer:
-            self.mlp = DeepseekV3MoE(
+            moe_cls = (
+                Dots3NoteOwnedRowsMoE
+                if shared_strategy == "replicated_owned_rows"
+                else DeepseekV3MoE
+            )
+            self.mlp = moe_cls(
                 config,
                 mapping,
                 quant_config,
@@ -588,6 +720,7 @@ class Dots3NoteModel(DeepseekV3Model):
 
 class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
     model_cls = Dots3NoteModel
+    resolve_lm_head = resolve_dots3_note_lm_head
 
     def __init__(
         self,

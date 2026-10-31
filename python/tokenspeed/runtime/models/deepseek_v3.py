@@ -422,16 +422,8 @@ class DeepseekV3MoE(nn.Module):
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
         if config.n_shared_experts is not None:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV3MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
-                hidden_act=config.hidden_act,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                prefix=add_prefix("shared_experts", prefix),
-                is_shared_expert=True,
-                batch_invariant=False,
+            self.shared_experts = self._make_shared_experts(
+                config, quant_config, prefix
             )
 
         self.experts = MoELayer(
@@ -470,6 +462,26 @@ class DeepseekV3MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             output_format=self.experts.topk_output_format,
         )
+
+    def _make_shared_experts(self, config, quant_config, prefix):
+        return DeepseekV3MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            hidden_act=config.hidden_act,
+            mapping=self.mapping,
+            quant_config=quant_config,
+            prefix=add_prefix("shared_experts", prefix),
+            is_shared_expert=True,
+            batch_invariant=False,
+        )
+
+    def _shared_expert_output(self, hidden_states):
+        if self.n_shared_experts is not None and hidden_states.shape[0] > 0:
+            return self.shared_experts(hidden_states)
+        return None
+
+    def _add_shared_expert_output(self, routed_output, shared_output):
+        return routed_output + shared_output
 
     def get_moe_routed_weights(self):
         return [
@@ -513,8 +525,7 @@ class DeepseekV3MoE(nn.Module):
 
             shared_output = None
             with fork.branch():
-                if self.n_shared_experts is not None and num_tokens > 0:
-                    shared_output = self.shared_experts(hidden_states)
+                shared_output = self._shared_expert_output(hidden_states)
 
         if deferred_finalize:
             gemm2_out, expert_weights, expanded_idx = routed_expert_output
@@ -528,7 +539,7 @@ class DeepseekV3MoE(nn.Module):
             )
         else:
             final_hidden_states = (
-                routed_expert_output + shared_output
+                self._add_shared_expert_output(routed_expert_output, shared_output)
                 if shared_output is not None
                 else routed_expert_output
             )

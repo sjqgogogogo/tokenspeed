@@ -32,6 +32,7 @@ class Dots3NoteConfig(PretrainedConfig):
         topk_group=1,
         num_nextn_predict_layers=1,
         mtp_layer_offset=None,
+        shared_experts_strategy=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -40,6 +41,18 @@ class Dots3NoteConfig(PretrainedConfig):
 
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.mtp_layer_offset = mtp_layer_offset
+        # None preserves the checkpoint's existing shared-TP execution.
+        self.shared_experts_strategy = shared_experts_strategy
+        self.resolve_shared_experts_strategy()
+
+    def resolve_shared_experts_strategy(self) -> str:
+        # HF overrides update the config after its constructor, so model
+        # construction validates through this same entry too.
+        if self.shared_experts_strategy not in (None, "tp", "replicated_owned_rows"):
+            raise ValueError(
+                "dots3-note shared_experts_strategy must be tp or replicated_owned_rows"
+            )
+        return self.shared_experts_strategy or "tp"
 
     def for_mtp(self):
         """Derive the checkpoint's single dense SWA draft without changing the target."""
