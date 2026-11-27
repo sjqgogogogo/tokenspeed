@@ -3066,3 +3066,7 @@ only that result's stream, never a producer that may carry later collectives.
 Configured sampled-token alternatives follow the output-token row layout,
 including the complete captured verify window; trimming acceptance also trims
 the alternatives. Prompt logprobs remain eager-only.
+
+Standalone draft-expert tactic tuning excludes kernels that own all-to-all
+communication, including registered plugin kernels. Those kernels require
+scheduler-wide batch geometry and warm through the normal model forwards.

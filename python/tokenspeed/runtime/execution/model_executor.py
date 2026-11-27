@@ -1510,10 +1510,7 @@ class ModelExecutor:
                 continue
             # All-to-all and MegaMoE plans own collectives sized by the real
             # batch geometry; they have no FlashInfer tactics to tune either.
-            if (
-                layer.plan["a2a_backend"] == "deepep"
-                or layer.plan["solution"] == "mega_moe"
-            ):
+            if layer.supports_all_to_all_ep or layer.plan["solution"] == "mega_moe":
                 continue
             key = (
                 layer.plan["apply_kernel_name"],

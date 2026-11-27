@@ -1058,6 +1058,7 @@ def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
         layer.plan = {
             "apply_kernel_name": "fake_apply",
             "a2a_backend": a2a,
+            "supports_all_to_all_ep": a2a not in (None, "none"),
             "solution": solution,
             "support_routing": False,
             "supports_precomputed_topk": True,
