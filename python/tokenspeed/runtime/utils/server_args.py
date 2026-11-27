@@ -1518,12 +1518,13 @@ class ServerArgs:
                 or self.spec_draft_confidence_temperature <= 0
             ):
                 raise ValueError("confidence_temperature must be finite and positive")
-            if (
-                not self.enable_speculative_sampling
-                or self.speculative_algorithm != "DSPARK"
+            if self.speculative_algorithm != "DSPARK" or (
+                self.disaggregation_mode != "prefill"
+                and not self.enable_speculative_sampling
             ):
                 raise ValueError(
-                    "compact currently requires probability-aware DSPARK sampling"
+                    "compact requires DSPARK and probability-aware verification "
+                    "on decode-capable roles"
                 )
         elif any(value is not None for value in compact_options):
             raise ValueError(

@@ -3057,6 +3057,12 @@ interpret compact columns as vocabulary positions. Compact and vocabulary
 sharding cannot be combined. The invalid sentinel is above the rejection
 threshold, and the bonus-token column has no recorded proposal.
 
+Prefill samples its first output with the selected probability policy but
+never verifies a chain. Compact sampling is therefore valid there without
+`--enable-speculative-sampling` or a draft-q allocation. Decode-capable compact
+workers require recorded proposals; the verifier rejects missing probabilities
+or candidate IDs instead of changing its acceptance rule.
+
 A model may bind prepared communication resources to the serving stream
 through `ModelRunner.prepare_graph_capture` before final capture. It does not
 create a model-specific scheduling loop. On Ascend, each pending result leases
