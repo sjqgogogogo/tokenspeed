@@ -998,3 +998,11 @@ rounds logits once to BF16. Compile/cache keys contain model dimensions only;
 row count stays runtime, with M1 and capacity-8 kernels built together before
 capture. The native tile is a temporary CUDA implementation preserving the
 validated arithmetic; no AOT files or task-specific loader are needed.
+
+## Plugin collectives
+
+An out-of-tree MoE apply kernel can name its transport in the `a2a_backend`
+trait and declare `supports_all_to_all_ep={True}`. The planner accepts that
+registered name, then filters the provider by platform, geometry, format and
+all requested traits. A name alone cannot admit a non-collective provider;
+unregistered names are rejected before selection.

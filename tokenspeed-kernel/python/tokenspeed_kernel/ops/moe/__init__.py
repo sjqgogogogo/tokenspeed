@@ -1547,6 +1547,13 @@ def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
 def _validate_a2a_backend(a2a_backend: str | None) -> None:
     if a2a_backend in {None, "none", "deepep", "gluon_petit"}:
         return
+    # Plugin apply kernels own their transport and advertise it in the same
+    # traits used for plan selection; the host need not name every vendor.
+    for spec in KernelRegistry.get().get_for_operator("moe", "apply"):
+        if a2a_backend in spec.traits.get(
+            "a2a_backend", ()
+        ) and True in spec.traits.get("supports_all_to_all_ep", ()):
+            return
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 
 
