@@ -29,11 +29,20 @@ pytestmark = pytest.mark.usefixtures("fresh_registry")
 
 def _plan(backend):
     return moe_plan(
-        "unquant", input_dtype=torch.float32, activation="swiglu",
-        routing_mode="precomputed_topk", a2a_backend=backend,
-        ep_size=2, ispp=16, hidden=8, swiglu_form="standard",
-        activation_clamped=False, expert_id_repeats=False,
-        fast_math=False, combine_order="rank", features=frozenset(),
+        "unquant",
+        input_dtype=torch.float32,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        a2a_backend=backend,
+        ep_size=2,
+        ispp=16,
+        hidden=8,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=False,
+        combine_order="rank",
+        features=frozenset(),
         solution="fixture_collective",
     )
 
@@ -41,7 +50,9 @@ def _plan(backend):
 @pytest.mark.parametrize("collective", [False, True])
 def test_registered_collective_backend_reaches_its_apply(collective):
     @register_kernel(
-        "moe", "apply", name="fixture_collective_apply",
+        "moe",
+        "apply",
+        name="fixture_collective_apply",
         solution="fixture_collective",
         signatures=format_signatures("x", "dense", {torch.float32}),
         traits={
@@ -65,5 +76,7 @@ def test_registered_collective_backend_reaches_its_apply(collective):
 
 
 def test_unregistered_collective_backend_is_rejected():
-    with pytest.raises(NotImplementedError, match="unsupported: unregistered_transport"):
+    with pytest.raises(
+        NotImplementedError, match="unsupported: unregistered_transport"
+    ):
         _plan("unregistered_transport")
