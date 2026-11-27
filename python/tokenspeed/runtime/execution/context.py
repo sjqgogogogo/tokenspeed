@@ -195,8 +195,9 @@ class ForwardContext:
     # ``logprob_start_len``); None when no extend row asks for any.
     input_logprob_rows: InputLogprobRows | None = None
     # How many most likely tokens each prefill row's sampled token is
-    # reported with (the requests' ``top_logprobs_num``); 0 for none, and in every
-    # captured graph.
+    # reported with (the requests' ``top_logprobs_num``); 0 for none. A sampler's
+    # startup-fixed alternatives output also runs in graphs independently of
+    # this eager-prefill request count.
     sampled_top_k: int = 0
     # Set by a target model that captures its taps on a narrowed row subset
     # (see CapturedRows); None means one captured row per input row.
@@ -220,6 +221,8 @@ class ForwardContext:
     # forward or travels in PPStageState, never on ctx. A configured producer
     # owns context cache writes; otherwise the drafter owns them.
     dspark_context_producer: DSparkContextProducer | None = None
+    # Decode-only readiness of this forward's verified-block draft window.
+    dspark_context_kv_ready: torch.Event | None = None
 
     def apply_dp_metadata(
         self, metadata: DpForwardMetadata | None, *, required: bool

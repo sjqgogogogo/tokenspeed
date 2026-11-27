@@ -576,6 +576,7 @@ impl HostConfig {
                         lm_head_tp_under_dp: config.getattr("lm_head_tp_under_dp")?.extract()?,
                         // The PD decode role's prefill node returns them.
                         computes_prompt_logprobs: role != Role::Decode,
+                        fixed_top_logprobs: servability.getattr("fixed_top_logprobs")?.extract()?,
                     }
                 },
             },

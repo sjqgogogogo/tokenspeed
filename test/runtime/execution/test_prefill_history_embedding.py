@@ -217,6 +217,7 @@ def _config():
         prefill_graph_capture_sizes=[16, 32],
         disable_autotune=True,
         acl_graph_memory_policy="discard",
+        moe_load_stat_interval=None,
     )
 
 

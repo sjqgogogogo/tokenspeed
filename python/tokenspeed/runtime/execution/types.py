@@ -29,6 +29,7 @@ import torch
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution._draft_overlap import RoundFence
+    from tokenspeed.runtime.execution.copy_completion import CopyStreamCompletion
     from tokenspeed.runtime.grammar.capturable_grammar import (
         GrammarStepCompletion,
     )
@@ -272,11 +273,11 @@ class PlannedForward:
 
 @dataclass
 class ForwardLogprobs:
-    """The logprobs an eager extend forward returns beside its sampled
-    tokens': the planned prompt rows' (``ForwardContext.input_logprob_rows``),
-    and the top-k alternatives of those rows and of the prefill rows' sampled
-    tokens (``ForwardContext.sampled_top_k``). A forward that asked for none of
-    them -- every captured graph among them -- returns None in its place.
+    """Prompt logprobs and sampled-token alternatives beside the forward output.
+
+    Prompt rows are eager-only. Alternatives may be computed with a fixed
+    startup width in both eager and captured decode, in the same row layout
+    as output tokens. A forward returning none of these uses None instead.
     """
 
     input_token_logprobs: torch.Tensor | None = None
@@ -299,6 +300,29 @@ class ForwardLogprobs:
 
     def is_empty(self) -> bool:
         return all(value is None for value in vars(self).values())
+
+    def slice_decode(self, rows: int) -> ForwardLogprobs:
+        """Exclude padded decode rows while retaining the captured tensor storage."""
+        if any(
+            value is not None
+            for value in (
+                self.input_token_logprobs,
+                self.input_top_logprobs_val,
+                self.input_top_logprobs_idx,
+            )
+        ):
+            raise ValueError("Decode outputs cannot contain prompt logprobs")
+        values, ids = self.output_top_logprobs_val, self.output_top_logprobs_idx
+        if (values is None) != (ids is None):
+            raise ValueError("Alternative values and IDs must be paired")
+        if rows < 0 or (
+            values is not None and (values.shape != ids.shape or rows > values.shape[0])
+        ):
+            raise ValueError("Captured alternatives do not cover the live decode rows")
+        return ForwardLogprobs(
+            output_top_logprobs_val=None if values is None else values[:rows],
+            output_top_logprobs_idx=None if ids is None else ids[:rows],
+        )
 
     def to_host(self) -> ForwardLogprobs:
         """Non-blocking D2H copies, landed by the result's copy event."""
@@ -327,7 +351,7 @@ class ModelExecutionResult:
     """
 
     output_tokens: torch.Tensor
-    copy_event: torch.cuda.Event | RoundFence | None = None
+    copy_event: torch.cuda.Event | RoundFence | CopyStreamCompletion | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
     # Per-position fp32 logprob of the sampled token, same layout as output_tokens.

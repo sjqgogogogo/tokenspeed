@@ -145,6 +145,22 @@ class ModelRunner:
             is_draft_worker: Whether this is the speculative draft model.
         """
         # Store configuration
+        target_server_args = server_args
+        if is_draft_worker:
+            server_args = server_args.for_draft_model()
+        if server_args.moe_random_physical_rng is not None:
+            server_args.validate_expert_placement_options()
+            if resolve_architecture(model_config.hf_config) not in (
+                "DeepseekV41ForCausalLM",
+                "DeepseekV41ForCausalLMDSpark",
+            ):
+                raise ValueError(
+                    "Random physical routing is implemented only by Ascend V4.1"
+                )
+            logger.info(
+                f"Synthetic physical routing enabled: rng={server_args.moe_random_physical_rng}, "
+                f"draft={is_draft_worker}; source EP rank/local row, unnormalized weights"
+            )
         self.model_config = model_config
         self.server_args = server_args
         self.device = server_args.device
@@ -181,15 +197,6 @@ class ModelRunner:
             vocab_size=model_config.vocab_size,
         )
 
-        draft_moe_override = (
-            self.is_draft_worker
-            and server_args.draft_moe_backend is not None
-            and server_args.draft_moe_backend != server_args.moe_backend
-        )
-        if draft_moe_override:
-            saved_moe_backend = server_args.moe_backend
-            server_args.moe_backend = server_args.draft_moe_backend
-
         # Auto-detect FP8 KV cache from checkpoint quant config (e.g. NVFP4 models
         # with kv_cache_quant_algo: "FP8" in hf_quant_config.json).
         if server_args.kv_cache_dtype == "auto":
@@ -211,19 +218,23 @@ class ModelRunner:
         )
         # The target's expert placement (redundant replicas, load counters) is
         # process-global so its model picks it up while it is built and loaded.
-        # A draft routes its own experts trivially: the target's placement is
-        # hidden while the draft is built, then restored for serving.
+        # A draft builds an independent placement from its own layer/expert
+        # geometry. Restore the target's placement and global options afterward.
         # Online rebalancing (--enable-eplb) moves the target's expert weights
         # between slots: its staging buffer and P2P channels are reserved here,
         # after the load and before the cache profile sizes the KV arena.
         self.expert_location_updater: ExpertLocationUpdater | None = None
         if self.is_draft_worker:
             target_placement = get_global_expert_location_metadata()
-            set_global_expert_location_metadata(None)
             try:
+                set_global_expert_location_metadata(
+                    build_expert_placement(server_args, model_config)
+                )
                 self.load_model()
             finally:
                 set_global_expert_location_metadata(target_placement)
+                global_server_args_dict_update(target_server_args)
+                initialize_moe_config(target_server_args)
         else:
             set_global_expert_location_metadata(
                 build_expert_placement(server_args, model_config)
@@ -233,10 +244,6 @@ class ModelRunner:
                 self.expert_location_updater = build_expert_location_updater(
                     self.model, model_config, server_args
                 )
-        if draft_moe_override:
-            server_args.moe_backend = saved_moe_backend
-            global_server_args_dict_update(server_args)
-            initialize_moe_config(server_args)
 
     def load_model(self):
         self.model = WeightLoader.load_model(
@@ -294,6 +301,12 @@ class ModelRunner:
             self.model,
             device=warmup_device,
         )
+
+    def prepare_graph_capture(self) -> None:
+        """Bind model-owned resources to the serving stream before capture."""
+        hook = getattr(self.model, "prepare_graph_capture", None)
+        if hook is not None:
+            hook()
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Allocate model communication buffers before cache planning.

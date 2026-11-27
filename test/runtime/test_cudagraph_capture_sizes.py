@@ -80,6 +80,7 @@ def _config(
         prefill_graph_max_tokens=256,
         enable_memory_saver=False,
         acl_graph_memory_policy="discard",
+        moe_load_stat_interval=None,
     )
 
 

@@ -50,6 +50,8 @@ class All2AllBackend(Enum):
     DEEPEP = "deepep"
     FLASHINFER = "flashinfer"
     GLUON_PETIT = "gluon_petit"
+    ASCEND_MC2 = "ascend_mc2"
+    ASCEND_DIRECTED = "ascend_directed"
 
     @classmethod
     def _missing_(cls, value):
@@ -59,6 +61,11 @@ class All2AllBackend(Enum):
             if value == member.value:
                 return member
         raise ValueError(f"No {cls.__name__} member for value {value}")
+
+    @property
+    def expert_load_uses_local_rows(self) -> bool:
+        """Whether the router records local inputs before all-to-all dispatch."""
+        return self in (All2AllBackend.ASCEND_MC2, All2AllBackend.ASCEND_DIRECTED)
 
     def is_none(self):
         return self == All2AllBackend.NONE

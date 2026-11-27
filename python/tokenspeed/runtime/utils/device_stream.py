@@ -22,11 +22,12 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
+from tokenspeed_kernel.platform import on_accelerator
 
 
 def is_current_stream_capturing(device: torch.device) -> bool:
-    """Query capture on the tensor's accelerator; CPU has no graph capture."""
-    if device.type == "cpu":
+    """Query device stream capture; CPU and meta have no accelerator stream."""
+    if not on_accelerator(device):
         return False
     return torch.get_device_module(device).is_current_stream_capturing()
 
@@ -121,6 +122,18 @@ class StreamFork:
                 self._active = False
                 self._overlap = True
                 self._current = None
+
+    @contextmanager
+    def branch_after_main(self):
+        """Start auxiliary work after operations already submitted on main.
+
+        Each branch records its completion as usual. Later branches keep the
+        dependency on the newest main-stream work in eager and captured execution.
+        """
+        if self._active:
+            self.fork_event.record(self._current)
+        with self.branch():
+            yield
 
     @contextmanager
     def branch(self):

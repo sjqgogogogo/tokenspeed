@@ -113,7 +113,9 @@ def _sampler(
         output_length=N,
         device="cuda",
     )
-    states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0, shard=shard)
+    states.init_draft_probs(
+        spec_num_tokens=N, reject_threshold=2.0, shard=shard, candidate_cap=None
+    )
     states.valid_cache_lengths.copy_(torch.arange(POOL + 1, dtype=torch.int32) * 37)
     buffers = InputBuffers(
         max_bs=MAX_BS,

@@ -723,6 +723,18 @@ class Mapping(MappingBase):
         self.base_gpu_id = base_gpu_id
         self.gpu_id_step = gpu_id_step
 
+    @property
+    def lm_head_crosses_attention_dp(self) -> bool:
+        """The head group holds different request rows and needs a transpose."""
+        return self.attn.has_dp and self.attn.tp_size == 1 and self.lm_head.has_tp
+
+    @property
+    def lm_head_skip_all_gather(self) -> bool:
+        """Replicated and cross-DP heads already return each rank's vocabulary."""
+        return self.attn.has_dp and (
+            not self.lm_head.has_tp or self.lm_head_crosses_attention_dp
+        )
+
     def _on_rank_initialized(self, rank: int):
         self.attn.rank = rank
         self.lm_head.rank = rank

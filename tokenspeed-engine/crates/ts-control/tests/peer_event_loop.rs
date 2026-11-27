@@ -182,6 +182,7 @@ fn loop_config(in_flight_depth: usize) -> LoopConfig {
                 disaggregated: false,
                 lm_head_tp_under_dp: false,
                 computes_prompt_logprobs: true,
+                fixed_top_logprobs: None,
             },
         },
         kv_total_pages: kv,

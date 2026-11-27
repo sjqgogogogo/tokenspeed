@@ -440,6 +440,7 @@ fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
                 disaggregated: false,
                 lm_head_tp_under_dp: false,
                 computes_prompt_logprobs: true,
+                fixed_top_logprobs: None,
             },
         },
         kv_total_pages: pages as i64,

@@ -307,20 +307,17 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
     ``outputs`` is what the captured forward returned: ``(output_tokens,
     output_lengths, output_logprobs, output_cumulative_probs,
     forward_logprobs)`` for the padded batch. The sampled-token columns keep
-    ``bs * max_tokens_per_req`` rows and the lengths ``bs``; a decode graph
-    never gathers prompt logprobs or top-k alternatives, so its last output is
-    None.
+    ``bs * max_tokens_per_req`` rows and the lengths ``bs``. Prompt logprobs
+    remain eager-only; a sampler may return startup-fixed decode alternatives.
     """
     tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
-    if forward_logprobs is not None:
-        raise RuntimeError("a captured decode graph returned prompt or top-k logprobs")
     rows = bs * max_tokens_per_req
     return (
         tokens[:rows],
         lengths[:bs],
         None if logprobs is None else logprobs[:rows],
         None if cumulative_probs is None else cumulative_probs[:rows],
-        None,
+        None if forward_logprobs is None else forward_logprobs.slice_decode(rows),
     )
 
 
@@ -755,6 +752,21 @@ class ForwardStepRunner:
             return CUDA_GRAPH_VARIANT_DEFAULT
         return self.sampling_backend.cuda_graph_replay_variant(self.max_tokens_per_req)
 
+    @staticmethod
+    def _update_npu_graph_inputs(graph, seq_lens: torch.Tensor) -> None:
+        # Custom kernels read refreshed device buffers directly. Only operators
+        # registered with the NPU graph dispatcher consume these CPU arguments.
+        # Materializing them for an empty record list would synchronize replay
+        # preparation without updating any captured task.
+        if not graph.graph_dispatch_mode.graph_dispatch_records:
+            return
+        with torch.inference_mode():
+            graph.update(
+                cpu_update_input=[
+                    {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
+                ]
+            )
+
     def _cuda_graph_key(self, bs: int) -> tuple[str, int]:
         variant = self._query_variant(
             self._cuda_graph_replay_variant(),
@@ -923,6 +935,11 @@ class ForwardStepRunner:
             ),
             draft_probs=(
                 self.runtime_states.draft_probs
+                if self.runtime_states is not None
+                else None
+            ),
+            draft_token_ids=(
+                self.runtime_states.draft_token_ids
                 if self.runtime_states is not None
                 else None
             ),
@@ -1128,6 +1145,11 @@ class ForwardStepRunner:
                     ),
                     draft_probs=(
                         self.runtime_states.draft_probs
+                        if self.runtime_states is not None
+                        else None
+                    ),
+                    draft_token_ids=(
+                        self.runtime_states.draft_token_ids
                         if self.runtime_states is not None
                         else None
                     ),
@@ -1592,13 +1614,7 @@ class ForwardStepRunner:
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
-                # Update callbacks write the inference tensors created at capture.
-                with torch.inference_mode():
-                    graph.update(
-                        cpu_update_input=[
-                            {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                        ]
-                    )
+                self._update_npu_graph_inputs(graph, seq_lens)
             query_tokens = (
                 self._decode_query_tokens or padded_bs * self.max_tokens_per_req
             )

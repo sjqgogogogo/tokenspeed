@@ -44,9 +44,16 @@ __all__ = [
     "CapabilityRequirement",
     "Platform",
     "current_platform",
+    "on_accelerator",
     "max_active_ctas",
     "prepare_cuda_toolkit_env",
 ]
+
+
+def on_accelerator(value: torch.Tensor | torch.device) -> bool:
+    """Classify a tensor/device; implementations still require kernel selection."""
+    device = value if isinstance(value, torch.device) else value.device
+    return device.type not in {"cpu", "meta"}
 
 
 def prepare_cuda_toolkit_env() -> None:

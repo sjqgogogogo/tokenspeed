@@ -413,7 +413,7 @@ def _resolve_attn_side(
             is_qwen4_exp=False,
             is_qsa=False,
             is_inkling=False,
-            is_dspark=False,
+            is_dspark=any(a in _DSPARK_DRAFT_ARCHITECTURES for a in architectures),
             model_profile=model_config.model_profile,
         )
     text_config = getattr(hf_config, "text_config", hf_config)

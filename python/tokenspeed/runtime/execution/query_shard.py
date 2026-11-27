@@ -54,8 +54,6 @@ from dataclasses import dataclass
 
 import torch
 
-from tokenspeed.runtime.utils import is_pin_memory_available
-
 
 def scatter_count(num_tokens: int, size: int) -> list[int]:
     """Split ``num_tokens`` rows over ``size`` ranks, the first ranks one up.
@@ -184,6 +182,36 @@ class QueryShardPlan:
             )
 
     @classmethod
+    def for_execution(
+        cls,
+        *,
+        total_tokens: int,
+        input_lengths: Sequence[int],
+        num_extends: int,
+        size: int,
+        rank: int,
+        device: torch.device | str,
+    ) -> QueryShardPlan | None:
+        """Build an extend shard; pure decode retains its replicated row layout."""
+        if size < 1 or not 0 <= rank < size:
+            raise ValueError(f"query shard rank {rank} is outside a group of {size}")
+        if not 0 <= num_extends <= len(input_lengths):
+            raise ValueError("extend count is outside the request span")
+        if size == 1 or num_extends == 0:
+            return None
+        if num_extends != len(input_lengths):
+            raise ValueError(
+                "Query context parallelism requires separate extend and decode rounds"
+            )
+        return cls.from_forward(
+            total_tokens=total_tokens,
+            input_lengths=input_lengths,
+            size=size,
+            rank=rank,
+            device=device,
+        )
+
+    @classmethod
     def from_forward(
         cls,
         *,
@@ -285,7 +313,7 @@ class QueryShardPlan:
         )
         staged = torch.cat(host)
         device = torch.device(device)
-        if device.type != "cpu" and is_pin_memory_available():
+        if device.type != "cpu" and torch.cuda.is_available():
             staged = staged.pin_memory()
         staged = staged.to(device, non_blocking=True)
         views = torch.split(staged, [t.shape[0] for t in host])

@@ -1610,7 +1610,7 @@ impl OutputProcessor {
             // The prefill rows' sampled-token alternatives, in prefill output
             // order.
             let model_top = match &result.output_top_logprobs {
-                Some((values, ids)) if !is_decode => Some((
+                Some((values, ids)) => Some((
                     window_ref(values, pt, output_length),
                     window_ref(ids, pt, output_length),
                 )),
@@ -1779,11 +1779,14 @@ impl OutputProcessor {
                 }
                 let finished_before = state.finished();
                 if let Some((top_values, top_ids)) = state.output_top_logprobs.as_mut() {
-                    match model_top.filter(|(values, _)| j < values.len()) {
+                    let k = state.top_logprobs_num;
+                    match model_top.filter(|(values, ids)| {
+                        values.get(j).is_some_and(|row| row.len() >= k)
+                            && ids.get(j).is_some_and(|row| row.len() >= k)
+                    }) {
                         Some((values, ids)) => {
-                            let k = state.top_logprobs_num;
-                            top_values.push(values[j][..k.min(values[j].len())].to_vec());
-                            top_ids.push(ids[j][..k.min(ids[j].len())].to_vec());
+                            top_values.push(values[j][..k].to_vec());
+                            top_ids.push(ids[j][..k].to_vec());
                         }
                         // The ingress takes a top-k request only when every
                         // token is sampled in a prefill, which reports the
@@ -1791,8 +1794,7 @@ impl OutputProcessor {
                         // without them.
                         None if !finished_before => {
                             state.finished_reason = Some(FinishReason::abort(
-                                "top-k logprobs are not computed for this step (decode steps \
-                                 return none)",
+                                "top-k logprobs are missing for this output step",
                             ));
                         }
                         None => {}
@@ -4656,5 +4658,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn decode_alternatives_follow_the_accepted_verify_rows() {
+        let mut p = processor(Some(4));
+        register_scored(&mut p, "r", vec![5, 6, 7], 2, 2, false);
+        let prefill = ForwardResult {
+            output_top_logprobs: Some((vec![vec![-0.1, -0.2]], vec![vec![7, 8]])),
+            ..result(&[7], &[1])
+        };
+        p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &prefill).unwrap();
+        let forward = ForwardResult {
+            output_top_logprobs: Some((
+                vec![vec![-1.0, -2.0]; 4],
+                vec![vec![10, 20], vec![11, 21], vec![12, 22], vec![13, 23]],
+            )),
+            ..result(&[10, 11, 12, 13], &[2])
+        };
+        let committed = p.commit(&batch(&[("r", 4, 0, 3)], 0), None, &forward).unwrap();
+        assert_eq!(committed.outputs[0].output_top_logprobs.as_ref().unwrap().1,
+                   vec![vec![10, 20], vec![11, 21]]);
     }
 }

@@ -283,7 +283,7 @@ def test_high_slot_bootstrap_and_reset_preserve_padding(device):
     layout = RequestSlotLayout(5)
     states = RuntimeStates(layout.padding, 32, 32, 3, device)
     states.init_draft_trees(3)
-    states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0)
+    states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0, candidate_cap=None)
     states.valid_cache_lengths.fill_(17)
     states.future_input_map.fill_(9)
     states.spec_candidates_ready.fill_(True)
@@ -340,7 +340,7 @@ def test_two_row_graph_replay_resets_high_resident_slots():
 
     layout = RequestSlotLayout(5)
     states = RuntimeStates(layout.padding, 32, 32, 3, "cuda")
-    states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0)
+    states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0, candidate_cap=None)
     indices = torch.tensor([1, 2], dtype=torch.int64, device="cuda")
     lengths = torch.tensor([11, 12], dtype=torch.int32, device="cuda")
     graph = torch.cuda.CUDAGraph()

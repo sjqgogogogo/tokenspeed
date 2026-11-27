@@ -272,8 +272,15 @@ class AttnConfig:
                 raise ValueError(
                     "DSA query context parallelism requires KVP equal to QCP"
                 )
-            if torch.device(self.device).type != "cuda":
-                raise ValueError("GPU query context parallelism requires CUDA")
+            from tokenspeed.runtime.plugins.registry import (
+                query_context_parallel_capability,
+            )
+
+            devices, _ = query_context_parallel_capability(softmax.backend_name)
+            if torch.device(self.device).type not in devices:
+                raise ValueError(
+                    f"Query context parallelism requires one of {sorted(devices)}"
+                )
             # The sharded KV write gathers the rotated latent and stores it
             # with latent_store, which writes native (bf16) rows only.
             if not is_v41 and (

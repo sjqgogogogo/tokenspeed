@@ -94,6 +94,8 @@ pub struct LogprobServability {
     pub lm_head_tp_under_dp: bool,
     /// This engine runs the prompt rows (not the PD decode role).
     pub computes_prompt_logprobs: bool,
+    /// Startup-fixed sampler alternative capacity, including captured decode.
+    pub fixed_top_logprobs: Option<i64>,
 }
 
 impl LogprobServability {
@@ -145,7 +147,11 @@ impl LogprobServability {
                  {top_logprobs_num}."
             ));
         }
-        if max_new_tokens.unwrap_or(0) > 1 {
+        if let Some(capacity) = self.fixed_top_logprobs {
+            if top_logprobs_num > capacity {
+                return Some(format!("top_logprobs_num={top_logprobs_num} exceeds configured capacity {capacity}"));
+            }
+        } else if max_new_tokens.unwrap_or(0) > 1 {
             return Some(
                 "top_logprobs_num > 0 needs max_new_tokens <= 1: top-k logprobs are \
                  computed for the prompt and the token a prefill samples, not for decode \
@@ -640,6 +646,7 @@ mod tests {
                 disaggregated: false,
                 lm_head_tp_under_dp: false,
                 computes_prompt_logprobs: true,
+                fixed_top_logprobs: None,
             },
         }
     }
@@ -1380,5 +1387,16 @@ mod tests {
             refused_message(admit(request, &limits).expect("answered")),
             "Invalid request: item 0's encode handshake is malformed"
         );
+    }
+
+    #[test]
+    fn fixed_sampler_alternatives_cover_decode_and_enforce_capacity() {
+        let mut capability = limits().logprobs;
+        assert!(capability.top_logprobs_refusal(2, Some(100)).is_some());
+        capability.fixed_top_logprobs = Some(5);
+        assert!(capability.top_logprobs_refusal(5, Some(100)).is_none());
+        assert!(capability.top_logprobs_refusal(6, Some(100)).is_some());
+        capability.fixed_top_logprobs = Some(0);
+        assert!(capability.top_logprobs_refusal(1, Some(1)).is_some());
     }
 }

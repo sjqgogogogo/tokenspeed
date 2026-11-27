@@ -406,6 +406,7 @@ def _executor_config(spec_algo: str) -> ModelExecutorConfig:
         spec_algo=spec_algo,
         spec_num_tokens=N,
         acl_graph_memory_policy="discard",
+        moe_load_stat_interval=None,
     )
 
 

@@ -24,6 +24,7 @@ import contextlib
 import gc
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -62,6 +63,7 @@ from tokenspeed.runtime.execution.accept_simulation import (
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
+from tokenspeed.runtime.execution.copy_completion import CopyStreamPool
 from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
     ladder_from_plan,
@@ -204,6 +206,10 @@ def _set_sampled_top_logprobs(
     graph), so no graph records this.
     """
     if top_k <= 0 or prefill_logits.shape[0] == 0:
+        return
+    if logits_output.sampled_top_logprobs_val is not None:
+        if logits_output.sampled_top_logprobs_val.shape[1] < top_k:
+            raise ValueError("Sampler alternatives do not cover the requested top-k")
         return
     values, ids = top_token_logprobs(prefill_logits, top_k)
     logits_output.sampled_top_logprobs_val = values
@@ -417,6 +423,7 @@ class ModelExecutorConfig:
     # 1..max_resident_requests and row 0 is reserved, so this must sit after the
     # scheduler-owned range.
     max_req_pool_size: int
+    moe_load_stat_interval: int | None
     output_length: int
     enforce_eager: bool
     acl_graph_memory_policy: str
@@ -561,6 +568,7 @@ class ModelExecutorConfig:
 
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
+            moe_load_stat_interval=server_args.moe_load_stat_interval,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
             enable_dp_local_cuda_graph=server_args.enable_dp_local_cuda_graph,
@@ -810,6 +818,26 @@ class ModelExecutor:
             )
         # After the target's shard decision: a drafter sharded alike records q over its shard.
         self._init_sampled_drafting(config, spec_num_tokens)
+        self.moe_load_statistics = None
+        if config.moe_load_stat_interval is not None:
+            from tokenspeed.runtime.moe.load_statistics import build_moe_load_statistics
+
+            if (
+                self.drafter is not None
+                and not self.drafter.expert_load_round_in_forward
+            ):
+                raise ValueError(
+                    "Expert-load statistics require drafting inside the forward round"
+                )
+            models = [self.model_runner.model]
+            if draft_model_runner is not None:
+                models.append(draft_model_runner.model)
+            self.moe_load_statistics = build_moe_load_statistics(
+                models,
+                interval=config.moe_load_stat_interval,
+                group=pg_manager.get_device_process_group(tuple(config.world_group)),
+                device=self.device,
+            )
         self._simulated_accept_length = parse_simulated_accept_length(
             envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
             spec_algorithm=config.spec_algo,
@@ -895,6 +923,11 @@ class ModelExecutor:
         # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
+        self._output_copy_pool = (
+            CopyStreamPool(self.device_module, self.device)
+            if torch.device(self.device).type == "npu"
+            else None
+        )
         # Throttles the mm_timing line inside execute_forward_op; the
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
@@ -1929,6 +1962,7 @@ class ModelExecutor:
         shard = logits_output.vocab_shard
         token_ids = logits_output.next_token_ids
         token_parts, length_parts, logprob_parts = [], [], []
+        top_value_parts, top_id_parts = [], []
 
         if num_prefill_outputs:
             prefill_out = LogitsProcessorOutput(
@@ -1944,8 +1978,11 @@ class ModelExecutor:
             )
             if sampled_top_k:
                 _set_sampled_top_logprobs(
-                    logits_output, prefill_out.next_token_logits, sampled_top_k
+                    prefill_out, prefill_out.next_token_logits, sampled_top_k
                 )
+            if prefill_out.sampled_top_logprobs_val is not None:
+                top_value_parts.append(prefill_out.sampled_top_logprobs_val)
+                top_id_parts.append(prefill_out.sampled_top_logprobs_idx)
             # verify writes the same backend buffers; snapshot the prefix.
             token_parts.append(tokens.clone() if num_decodes else tokens)
             length_parts.append(lengths.clone() if num_decodes else lengths)
@@ -1985,6 +2022,9 @@ class ModelExecutor:
             )
             token_parts.append(tokens)
             length_parts.append(lengths)
+            if decode_out.sampled_top_logprobs_val is not None:
+                top_value_parts.append(decode_out.sampled_top_logprobs_val)
+                top_id_parts.append(decode_out.sampled_top_logprobs_idx)
             if decode_out.next_token_logprobs is not None:
                 logprob_parts.append(decode_out.next_token_logprobs)
         if logprob_parts:
@@ -1993,6 +2033,9 @@ class ModelExecutor:
                 if len(logprob_parts) == 1
                 else torch.cat(logprob_parts)
             )
+        if top_value_parts:
+            logits_output.sampled_top_logprobs_val = torch.cat(top_value_parts)
+            logits_output.sampled_top_logprobs_idx = torch.cat(top_id_parts)
         if not token_parts:
             token_parts.append(
                 torch.empty(
@@ -2099,6 +2142,10 @@ class ModelExecutor:
             output_tokens = torch.zeros(bs, dtype=torch.int32, device=self.device)
             accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
             return output_tokens, accept_lengths, None, None
+
+        ctx.dspark_context_kv_ready = None
+        if self.drafter is not None and self.tree_spec is None:
+            self.drafter.prepare_target_verify(ctx, logits_output)
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
@@ -2305,6 +2352,14 @@ class ModelExecutor:
                 spec_num_tokens=spec_num_tokens,
                 reject_threshold=config.spec_reject_draft_prob_threshold,
                 shard=self._draft_probs_shard(),
+                candidate_cap=(
+                    min(
+                        self.sampling_backend.config.compact_sampling.force_topk,
+                        self.runtime_states.vocab_size,
+                    )
+                    if self.sampling_backend.config.compact_sampling is not None
+                    else None
+                ),
             )
 
     def _draft_probs_shard(self) -> tuple[int, int] | None:
@@ -2351,6 +2406,7 @@ class ModelExecutor:
                 else None
             ),
             draft_probs=self.runtime_states.draft_probs,
+            draft_token_ids=self.runtime_states.draft_token_ids,
             draft_q=self.runtime_states.future_draft_q,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
@@ -2365,6 +2421,8 @@ class ModelExecutor:
         """
         self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
+            if self.moe_load_statistics is not None:
+                self.moe_load_statistics.begin_round()
             graph_forward_mode = ForwardMode.DECODE
             ctx = ForwardContext(
                 attn_backend=self.attn_backend,
@@ -2425,6 +2483,7 @@ class ModelExecutor:
                         # A task, not a forward: the thread settled any pending round.
                         settle=lambda: None,
                     )
+                self._step_moe_load_statistics()
                 return
 
             # Run model forward with IDLE mode — skips attention but still
@@ -2489,6 +2548,13 @@ class ModelExecutor:
                         spec_step_idx=step_idx,
                         **draft_kwargs,
                     )
+            self._step_moe_load_statistics()
+
+    def _step_moe_load_statistics(self) -> None:
+        if self.moe_load_statistics is not None and self.moe_load_statistics.step():
+            logger.info(
+                f"moe_load_stat_flush rank={self.config.global_rank} round={self.moe_load_statistics.rounds}"
+            )
 
     # ------------------------------------------------------------------
     # Slot-state image (SlotStateExporter): the retraction snapshot's blob
@@ -2763,7 +2829,17 @@ class ModelExecutor:
             # cross-stream wait -- their writers ran on execution_stream too.
             self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
+            if self.moe_load_statistics is not None:
+                self.moe_load_statistics.begin_round()
             bs = len(forward_op.request_ids)
+            query_shard = QueryShardPlan.for_execution(
+                total_tokens=total_tokens,
+                input_lengths=forward_op.input_lengths[:bs],
+                num_extends=num_extends,
+                size=self.config.query_shard_size,
+                rank=self.config.query_shard_rank,
+                device=self.device,
+            )
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
             rebound_slots = self.runtime_states.bind_stop_criteria(
@@ -2827,6 +2903,7 @@ class ModelExecutor:
                     total_tokens,
                     decode_input_ids,
                     ngram_inputs=ngram_inputs,
+                    query_shard=query_shard,
                 )
                 if (
                     self.sampling_backend.config.synthetic_acceptance_length is not None
@@ -2944,23 +3021,6 @@ class ModelExecutor:
                         num_decodes=bs - num_extends,
                         decode_width=self.config.output_length,
                     )
-                query_shard = None
-                if self.config.query_shard_size > 1:
-                    # The shard splits the packed extend span; host integers
-                    # from the same lengths gather_ids come from. The prefill
-                    # role never carries decode rows, so num_extends == bs.
-                    if num_extends != bs:
-                        raise RuntimeError(
-                            "query context parallelism shards pure extend "
-                            f"forwards; got {bs - num_extends} decode requests"
-                        )
-                    query_shard = QueryShardPlan.from_forward(
-                        total_tokens=total_tokens,
-                        input_lengths=forward_op.input_lengths[:bs],
-                        size=self.config.query_shard_size,
-                        rank=self.config.query_shard_rank,
-                        device=self.device,
-                    )
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -3077,77 +3137,101 @@ class ModelExecutor:
                     num_extends=num_extends,
                     output_layout=ctx.output_layout,
                 )
-            with nvtx_range("output_d2h", color="green"):
-                output_d2h_start = time.perf_counter() if timing_enabled else 0.0
-                next_input_ids = None
-                spec_candidate_tokens = None
-                if (
-                    capture_next_input_ids
-                    and self.drafter is not None
-                    and num_extends > 0
-                ):
-                    next_input_ids = self.runtime_states.future_input_map.index_select(
-                        0, self.input_buffers.req_pool_indices_buf[:num_extends]
-                    ).to("cpu", non_blocking=True)
-
-                # The candidate-vs-target compare reads the window as a chain.
-                if (
-                    LOG_SPEC_ACCEPT_LENGTHS
-                    and self.config.spec_algo is not None
-                    and num_extends == 0
-                    and self.tree_spec is None
-                ):
-                    spec_candidate_tokens = self.input_buffers.input_ids_buf[
-                        : bs * self.config.spec_num_tokens
-                    ].to("cpu", non_blocking=True)
-
-                # Defensive clamp into the valid vocab range (kept from the
-                # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
-                # value surfaced by the intermittent spec-decode decode-state race
-                # -- would otherwise reach the frontend's detokenizer as a
-                # token outside the vocabulary.
-                # It must run on-GPU *before* the non_blocking D2H: clamping the
-                # CPU result afterwards would race the in-flight copy. In-place
-                # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
-                # the get_packed_output_d2h data_ptr fast-path still fires -- and
-                # in-place on the forward's inference tensors is only legal inside
-                # inference mode, so re-enter it (maybe_inference_mode mirrors the
-                # forward and reduces to no_grad when inference mode is disabled,
-                # where output_tokens isn't an inference tensor anyway).
-                vocab_size = self.runtime_states.vocab_size
-                with maybe_inference_mode():
-                    output_tokens.clamp_(0, vocab_size - 1)
-
-                packed = self.sampling_backend.get_packed_output_d2h(
-                    output_tokens, output_lengths
+            self._step_moe_load_statistics()
+            copy_completion = (
+                self._output_copy_pool.copy_after(
+                    self.execution_stream,
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        output_cumulative_probs,
+                        forward_logprobs,
+                        self.request_ends,
+                    ),
                 )
-                if packed is not None:
-                    output_tokens, output_lengths = packed
-                else:
-                    output_tokens = output_tokens.to("cpu", non_blocking=True)
-                    output_lengths = output_lengths.to("cpu", non_blocking=True)
+                if self._output_copy_pool is not None
+                else None
+            )
+            with copy_completion if copy_completion is not None else nullcontext():
+                with nvtx_range("output_d2h", color="green"):
+                    output_d2h_start = time.perf_counter() if timing_enabled else 0.0
+                    next_input_ids = None
+                    spec_candidate_tokens = None
+                    if (
+                        capture_next_input_ids
+                        and self.drafter is not None
+                        and num_extends > 0
+                    ):
+                        next_input_ids = (
+                            self.runtime_states.future_input_map.index_select(
+                                0, self.input_buffers.req_pool_indices_buf[:num_extends]
+                            ).to("cpu", non_blocking=True)
+                        )
 
-                if output_logprobs is not None:
-                    output_logprobs = output_logprobs.to("cpu", non_blocking=True)
-                if output_cumulative_probs is not None:
-                    output_cumulative_probs = output_cumulative_probs.to(
+                    # The candidate-vs-target compare reads the window as a chain.
+                    if (
+                        LOG_SPEC_ACCEPT_LENGTHS
+                        and self.config.spec_algo is not None
+                        and num_extends == 0
+                        and self.tree_spec is None
+                    ):
+                        spec_candidate_tokens = self.input_buffers.input_ids_buf[
+                            : bs * self.config.spec_num_tokens
+                        ].to("cpu", non_blocking=True)
+
+                    # Defensive clamp into the valid vocab range (kept from the
+                    # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
+                    # value surfaced by the intermittent spec-decode decode-state race
+                    # -- would otherwise reach the frontend's detokenizer as a
+                    # token outside the vocabulary.
+                    # It must run on-GPU *before* the non_blocking D2H: clamping the
+                    # CPU result afterwards would race the in-flight copy. In-place
+                    # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
+                    # the get_packed_output_d2h data_ptr fast-path still fires -- and
+                    # in-place on the forward's inference tensors is only legal inside
+                    # inference mode, so re-enter it (maybe_inference_mode mirrors the
+                    # forward and reduces to no_grad when inference mode is disabled,
+                    # where output_tokens isn't an inference tensor anyway).
+                    vocab_size = self.runtime_states.vocab_size
+                    with maybe_inference_mode():
+                        output_tokens.clamp_(0, vocab_size - 1)
+
+                    packed = self.sampling_backend.get_packed_output_d2h(
+                        output_tokens, output_lengths
+                    )
+                    if packed is not None:
+                        output_tokens, output_lengths = packed
+                    else:
+                        output_tokens = output_tokens.to("cpu", non_blocking=True)
+                        output_lengths = output_lengths.to("cpu", non_blocking=True)
+
+                    if output_logprobs is not None:
+                        output_logprobs = output_logprobs.to("cpu", non_blocking=True)
+                    if output_cumulative_probs is not None:
+                        output_cumulative_probs = output_cumulative_probs.to(
+                            "cpu", non_blocking=True
+                        )
+                    if forward_logprobs is not None:
+                        forward_logprobs = forward_logprobs.to_host()
+                    else:
+                        forward_logprobs = ForwardLogprobs()
+
+                    output_nan_flags = self.nan_guard.flags_cpu
+                    # Every row as the stop conditions and the commit left it.
+                    output_request_ends = self.request_ends[:bs].to(
                         "cpu", non_blocking=True
                     )
-                if forward_logprobs is not None:
-                    forward_logprobs = forward_logprobs.to_host()
-                else:
-                    forward_logprobs = ForwardLogprobs()
 
-                output_nan_flags = self.nan_guard.flags_cpu
-                # Every row as the stop conditions and the commit left it.
-                output_request_ends = self.request_ends[:bs].to(
-                    "cpu", non_blocking=True
-                )
-
-                copy_event = self.device_module.Event()
-                copy_event.record()
-                if timing_enabled:
-                    output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
+                    if copy_completion is None:
+                        copy_event = self.device_module.Event()
+                        copy_event.record()
+                    else:
+                        copy_event = copy_completion
+                    if timing_enabled:
+                        output_d2h_ms = (
+                            time.perf_counter() - output_d2h_start
+                        ) * 1000.0
 
             # Enqueued behind the output copies; the next forward or task completes the rest.
             if self.drafter is not None and total_tokens > 0:

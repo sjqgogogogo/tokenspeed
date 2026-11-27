@@ -50,3 +50,16 @@ block-end length to `[low, high]` and writes it to the per-request row and to
 each of the request's entries; a block-causal draft's entry `e` of `n` gets
 `n - 1 - e` fewer tokens. CUDA runs one Triton launch for both; other devices
 run a clamp and a copy or subtraction.
+
+### Required Engram hash rows
+
+`prepare_ngram_inputs` accepts optional global packed row IDs for hashes the
+consumer needs. Request lookbacks, masks and accepted-frontier metadata still
+cover the whole input span; query ownership never resets n-grams. Providers
+may compute additional hashes. A row-selective provider must handle separated
+zigzag segments and an empty owner without omitting commit metadata. The
+Ascend adapter supplies its implementation through the kernel registry.
+
+`FillTailPlan` binds persistent padding buffers once and refreshes only their
+live extents through the `prepare_fill_tails` operator. Its provider owns the
+launch implementation; the runtime does not import device-specific kernels.

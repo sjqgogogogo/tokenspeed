@@ -931,7 +931,12 @@ def build_expert_placement(
         )
     placement = compute_initial_expert_location_metadata(server_args, model_config)
     if server_args.expert_distribution_recorder_mode is not None:
+        from tokenspeed.runtime.layers.moe.utils import All2AllBackend
+
         placement.enable_load_recording(server_args.mapping)
+        if All2AllBackend(server_args.all2all_backend).expert_load_uses_local_rows:
+            # Bind the local-row layout before routers retain the shared mask.
+            placement.load_rows = ExpertLoadRowMask.for_all_to_all(server_args.mapping)
     if server_args.ep_dispatch_algorithm in STATIC_EP_DISPATCH_ALGORITHMS and (
         server_args.all2all_backend != "none"
         # Attention-DP ranks route only their own tokens whatever carries the

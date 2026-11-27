@@ -427,6 +427,21 @@ class MoELayer(torch.nn.Module):
         elif moe_backend == "mega_moe":
             mapping = global_server_args_dict["mapping"]
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+        elif self._spec.a2a_backend == "ascend_directed":
+            # Peer windows exchange only host IPC keys during setup/teardown.
+            # They need an isolated CPU group, not an unused HCCL communicator.
+            mapping = global_server_args_dict["mapping"]
+            pg_manager.init_process_group(
+                mapping.moe.ep_group, backend="gloo", name="ascend_directed"
+            )
+            process_group = pg_manager.get_process_group(
+                "gloo", mapping.moe.ep_group, name="ascend_directed"
+            )
+        elif self._spec.a2a_backend == "ascend_mc2":
+            mapping = global_server_args_dict["mapping"]
+            process_group = pg_manager.get_dedicated_device_group(
+                mapping.moe.ep_group, self._spec.a2a_backend
+            )
         # --moe-combine-order: how a token's routed contributions meet across
         # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
         # ServerArgs already refused MoE TP > 1 under "slot"; over DeepEP the
@@ -589,6 +604,22 @@ class MoELayer(torch.nn.Module):
         self.plan["cutlass_fused_finalize"] = global_server_args_dict[
             "moe_cutlass_fused_finalize"
         ]
+        if self._spec.a2a_backend == "ascend_directed":
+            prefill_transport = global_server_args_dict[
+                "ascend_directed_prefill_transport"
+            ]
+            self.plan["prefill_transport"] = prefill_transport
+            self.plan["prefill_normal_enabled"] = prefill_transport != "directed"
+            self.plan["prefill_min_rows"] = global_server_args_dict[
+                "ascend_directed_prefill_min_rows"
+            ]
+            self.plan["prefill_process_group"] = (
+                pg_manager.get_dedicated_device_group(
+                    mapping.moe.ep_group, "ascend_directed_prefill"
+                )
+                if prefill_transport != "directed"
+                else None
+            )
         if precision_policy == "bf16_route_accum_fp32":
             if self.plan["apply_kernel_name"] != "triton_bf16_precomputed_moe_apply":
                 raise ValueError(

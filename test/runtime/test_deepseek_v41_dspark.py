@@ -776,7 +776,7 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool, *, sampled):
         from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
         drafter.runtime_states.init_draft_probs(
-            spec_num_tokens=width, reject_threshold=2.0
+            spec_num_tokens=width, reject_threshold=2.0, candidate_cap=None
         )
         sampler = FlashInferSamplingBackend(
             SamplingBackendConfig(

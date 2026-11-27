@@ -21,6 +21,7 @@
 """The arguments of the server."""
 
 import argparse
+import copy
 import dataclasses
 import json
 import math
@@ -84,7 +85,9 @@ logger = get_colorful_logger(__name__)
 # greedy verifies by exact match and the Triton backends by target-sampled
 # exact match; the step drafters' dense recorded distribution never enters
 # either.
-SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "sonic"})
+SPECULATIVE_SAMPLING_BACKENDS = frozenset(
+    {"flashinfer", "flashinfer_full", "sonic", "compact"}
+)
 # The one backend whose verify reads the DFlash2 candidate selector's sparse
 # draft q (RuntimeStates.future_draft_q): a DFlash2 draft needs it. A base DFLASH
 # draft records the dense q and takes SPECULATIVE_SAMPLING_BACKENDS; DFlash.
@@ -312,10 +315,12 @@ def validate_context_parallel_roles(
     dcp_size: int,
     qcp_size: int,
     disaggregation_mode: str,
+    qcp_roles: frozenset[str],
 ) -> None:
-    """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
+    """Validate KVP/DCP roles and a backend's declared query-shard roles.
 
     Aggregated and PD decode engines require explicit DCP matching KVP.
+    Query sharding applies to pure extend rounds, never pure decode rows.
     """
     if dcp_size < 1:
         raise ValueError(
@@ -327,13 +332,10 @@ def validate_context_parallel_roles(
             f"or decode (got {disaggregation_mode!r})"
         )
     if qcp_size > 1:
-        if disaggregation_mode != "prefill":
+        if disaggregation_mode not in qcp_roles:
             raise ValueError(
                 "--query-context-parallel-size > 1 requires --disaggregation-mode "
-                f"prefill (got {disaggregation_mode!r}): the query shard is a "
-                "prefill-role layout whose decode arm runs every row on every "
-                "rank (the drafter's steps only), which no engine serving "
-                "steady-state decode should pay"
+                f"in {sorted(qcp_roles)} for this backend (got {disaggregation_mode!r})"
             )
         if kvp_size not in (1, qcp_size):
             raise ValueError(
@@ -612,6 +614,12 @@ class ServerArgs:
     ep_size: int = 1
     init_expert_location: str = "trivial"
     ep_num_redundant_experts: int = 0
+    # Optional independent draft placement; None/0 keeps its identity layout.
+    draft_ep_num_redundant_experts: int | None = None
+    # Optional synthetic workload: the explicit RNG also opts into physical routing.
+    moe_random_physical_rng: Literal["philox4x32-10"] | None = None
+    # Optional per-round destination-load statistics, with an explicit interval.
+    moe_load_stat_interval: int | None = None
     ep_dispatch_algorithm: (
         Literal[
             "static",
@@ -732,6 +740,12 @@ class ServerArgs:
     # Pack Qwen4-Exp target and draft cache fields into one physical plane.
     qwen4_exp_flat_kv: bool = True
     sampling_backend: str | None = None
+    # Unconfigured outside compact; selecting compact requires all three.
+    sampling_force_topk: int | None = None
+    spec_reject_draft_prob_penalty: float | None = None
+    spec_draft_confidence_temperature: float | None = None
+    # Optional fixed alternatives output from the selected sampling distribution.
+    sampling_top_logprobs: int | None = None
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
     # draw depends on its co-batch; "per-request" keys it by (request seed,
@@ -765,6 +779,7 @@ class ServerArgs:
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
+    engram_tp_size: int | None = None
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
@@ -918,6 +933,13 @@ class ServerArgs:
     # group: per-rank partials summed by the host (rank), or folded in fp32
     # slot order inside the MoE leaf as the trainer does (slot).
     moe_combine_order: str = "rank"
+    # No implicit shared execution path: directed callers must select one.
+    # Omission is valid only for transports that do not use this provider.
+    ascend_directed_shared_layout: str | None = None
+    ascend_directed_schedule: str | None = None
+    ascend_directed_shared_precision: str | None = None
+    ascend_directed_prefill_transport: str | None = None
+    ascend_directed_prefill_min_rows: int | None = None
     # The order the sparse attention cores reduce a token's selected KV slots
     # in: as the top-k leaf emitted them (selection), or ascending (sorted,
     # batch-invariant whenever the selected set is).
@@ -1455,6 +1477,58 @@ class ServerArgs:
             )
 
     def resolve_kernel_backends(self):
+        if self.sampling_top_logprobs is not None:
+            if self.sampling_backend != "compact" or not self.enable_output_logprobs:
+                raise ValueError(
+                    "--sampling-top-logprobs requires compact and --enable-output-logprobs"
+                )
+            if self.sampling_top_logprobs < 1:
+                raise ValueError("--sampling-top-logprobs must be positive")
+        compact_options = (
+            self.sampling_force_topk,
+            self.spec_reject_draft_prob_penalty,
+            self.spec_draft_confidence_temperature,
+        )
+        if self.sampling_backend == "compact":
+            if self.sampling_stream != "batch":
+                raise ValueError(
+                    "compact requires --sampling-stream batch; position-keyed RNG is not implemented"
+                )
+            if any(value is None for value in compact_options):
+                raise ValueError(
+                    "compact requires explicit --sampling-force-topk, "
+                    "--spec-reject-draft-prob-penalty and --spec-draft-confidence-temperature"
+                )
+            if self.sampling_force_topk < 1:
+                raise ValueError("sampling_force_topk must be positive")
+            if (
+                self.sampling_top_logprobs is not None
+                and self.sampling_top_logprobs > self.sampling_force_topk
+            ):
+                raise ValueError(
+                    "--sampling-top-logprobs cannot exceed --sampling-force-topk"
+                )
+            if (
+                not math.isfinite(self.spec_reject_draft_prob_penalty)
+                or self.spec_reject_draft_prob_penalty < 0
+            ):
+                raise ValueError("draft_prob_penalty must be finite and non-negative")
+            if (
+                not math.isfinite(self.spec_draft_confidence_temperature)
+                or self.spec_draft_confidence_temperature <= 0
+            ):
+                raise ValueError("confidence_temperature must be finite and positive")
+            if (
+                not self.enable_speculative_sampling
+                or self.speculative_algorithm != "DSPARK"
+            ):
+                raise ValueError(
+                    "compact currently requires probability-aware DSPARK sampling"
+                )
+        elif any(value is not None for value in compact_options):
+            raise ValueError(
+                "Compact sampling parameters cannot be supplied to another backend"
+            )
         _require_choice(
             "--dense-gemm-backend",
             self.dense_gemm_backend,
@@ -1674,11 +1748,21 @@ class ServerArgs:
                 "--deepseek-v41-indexer-query-parallel-size must be 1 or the "
                 f"attention TP size {attn_tp_size}"
             )
+        from tokenspeed.runtime.plugins.registry import (
+            query_context_parallel_capability,
+        )
+
+        if self.mapping.attn.has_qcp and self.disaggregation_mode == "null":
+            from tokenspeed.runtime.plugins import ensure_loaded
+
+            ensure_loaded()
+        _, qcp_roles = query_context_parallel_capability(self.attention_backend)
         validate_context_parallel_roles(
             kvp_size=self.mapping.attn.kvp_size,
             dcp_size=self.decode_context_parallel_size,
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
+            qcp_roles=qcp_roles,
         )
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
@@ -3260,6 +3344,50 @@ class ServerArgs:
         counters, a static dispatch algorithm, the snapshot interval and the
         layers switched per round -- rather than auto-setting any of them.
         """
+        if self.moe_load_stat_interval is not None:
+            if (
+                isinstance(self.moe_load_stat_interval, bool)
+                or not isinstance(self.moe_load_stat_interval, int)
+                or self.moe_load_stat_interval <= 0
+            ):
+                raise ValueError("--moe-load-stat-interval must be a positive integer")
+            if self.moe_random_physical_rng is None:
+                raise ValueError(
+                    "--moe-load-stat-interval requires --moe-random-physical-rng"
+                )
+            if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
+                raise ValueError(
+                    "--moe-load-stat-interval cannot duplicate placement load recording"
+                )
+        if self.moe_random_physical_rng is not None:
+            if self.moe_random_physical_rng != "philox4x32-10":
+                raise ValueError("--moe-random-physical-rng supports philox4x32-10")
+            if os.environ.get("TOKENSPEED_MOE_ROUTING_SIMULATION", ""):
+                raise ValueError(
+                    "--moe-random-physical-rng cannot be combined with "
+                    "TOKENSPEED_MOE_ROUTING_SIMULATION"
+                )
+            m = self.mapping
+            if not (
+                self.device == "npu"
+                and self.moe_backend == "ascend_v41_w4a4"
+                and (
+                    self.all2all_backend == "none"
+                    or (
+                        self.all2all_backend == "ascend_directed"
+                        and m.world_size in (8, 32)
+                    )
+                )
+                and m.attn.dp_size == m.moe.ep_size == m.world_size
+                and m.world_size > 1
+                and m.attn.tp_size == m.dense.tp_size == m.moe.tp_size == 1
+                and m.pp_size == 1
+                and not m.attn.has_qcp
+            ):
+                raise ValueError(
+                    "--moe-random-physical-rng requires Ascend V4.1 W4A4, "
+                    "full-world DP/EP, TP1/PP1/CP1 and none or EP8/32 ascend_directed transport"
+                )
         if self.enable_eplb:
             if self.expert_distribution_recorder_mode != "stat":
                 raise ValueError(
@@ -3330,11 +3458,26 @@ class ServerArgs:
                 f"layers run with ep_size={self.mapping.moe.ep_size}; enable "
                 "expert parallelism (--ep-size > 1) or drop the redundant experts."
             )
-        if expert_placement_requested(self):
+        draft_redundancy = self.draft_ep_num_redundant_experts
+        if draft_redundancy is not None:
+            if draft_redundancy < 0:
+                raise ValueError(
+                    "--draft-ep-num-redundant-experts must be non-negative"
+                )
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    "--draft-ep-num-redundant-experts requires speculation"
+                )
+            if draft_redundancy > 0 and self.mapping.moe.ep_size <= 1:
+                raise ValueError(
+                    "--draft-ep-num-redundant-experts requires expert parallelism "
+                    f"(ep_size={self.mapping.moe.ep_size})"
+                )
+        if expert_placement_requested(self) or (draft_redundancy or 0) > 0:
             if self.ep_dispatch_algorithm is None:
                 raise ValueError(
                     "--ep-dispatch-algorithm is required with "
-                    "--ep-num-redundant-experts, a non-trivial "
+                    "--ep-num-redundant-experts, --draft-ep-num-redundant-experts, a non-trivial "
                     "--init-expert-location or --expert-distribution-recorder-mode: "
                     "static_with_zero_expert for models with zero experts, "
                     "static otherwise."
@@ -3353,6 +3496,89 @@ class ServerArgs:
                 f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} has no effect "
                 "without an expert placement (--ep-num-redundant-experts, "
                 "--init-expert-location or --expert-distribution-recorder-mode)."
+            )
+
+    def for_draft_model(self) -> "ServerArgs":
+        """Resolve the draft's load options without modifying target options.
+
+        The draft has an independent trivial-plus-replicas placement. Target
+        placement files, load recording and online rebalancing apply only to
+        target layers. The common explicit dispatch algorithm selects draft
+        replicas too. Normal prefill communication applies only to the target;
+        the draft retains directed communication. Retain this copy for
+        checkpoint reloads.
+        """
+        # __post_init__ resolves and scales topology-dependent limits; running
+        # it again through dataclasses.replace would resolve those twice.
+        draft = copy.copy(self)
+        draft.ep_num_redundant_experts = self.draft_ep_num_redundant_experts or 0
+        draft.init_expert_location = "trivial"
+        draft.expert_distribution_recorder_mode = None
+        draft.enable_eplb = False
+        draft.eplb_rebalance_num_iterations = None
+        draft.eplb_rebalance_layers_per_chunk = None
+        if draft.ep_num_redundant_experts == 0:
+            draft.ep_dispatch_algorithm = None
+        if self.draft_moe_backend is not None:
+            draft.moe_backend = self.draft_moe_backend
+        if draft.all2all_backend == "ascend_directed":
+            draft.ascend_directed_prefill_transport = "directed"
+            draft.ascend_directed_prefill_min_rows = None
+        return draft
+
+    def validate_directed_shared_options(self):
+        layout = self.ascend_directed_shared_layout
+        schedule = self.ascend_directed_schedule
+        precision = self.ascend_directed_shared_precision
+        prefill = self.ascend_directed_prefill_transport
+        min_rows = self.ascend_directed_prefill_min_rows
+        if self.all2all_backend != "ascend_directed":
+            if any(
+                value is not None
+                for value in (layout, schedule, precision, prefill, min_rows)
+            ):
+                raise ValueError(
+                    "--ascend-directed-shared-layout requires ascend_directed transport"
+                )
+            return
+        if schedule not in ("separated", "megamoe"):
+            raise ValueError(
+                "ascend_directed requires an explicit separated or megamoe schedule"
+            )
+        if layout != "replicated":
+            raise ValueError(
+                "ascend_directed requires --ascend-directed-shared-layout " "replicated"
+            )
+        if self.moe_backend != "ascend_v41_w4a4":
+            raise ValueError("Directed shared layouts require ascend_v41_w4a4")
+        if precision not in ("bf16", "int8"):
+            raise ValueError(
+                "ascend_directed requires --ascend-directed-shared-precision bf16 or int8"
+            )
+        if precision == "int8" and self.load_format not in ("auto", "safetensors"):
+            raise ValueError(
+                "INT8 shared experts require original FP8 safetensors loading"
+            )
+        if self.mapping.moe.ep_size == 32 and precision != "int8":
+            raise ValueError("EP32 directed MoE requires INT8 DP shared experts")
+        if self.mapping.moe.ep_size not in (8, 32):
+            raise ValueError("Accepted directed MoE configurations are EP8 and EP32")
+        if schedule == "megamoe" and precision != "int8":
+            raise ValueError("MegaMoE shared execution requires INT8 DP weights")
+        if prefill not in ("directed", "allgather", "alltoall"):
+            raise ValueError("ascend_directed requires an explicit prefill transport")
+        if prefill != "directed" and (
+            self.mapping.moe.ep_size != 8 or schedule != "separated"
+        ):
+            raise ValueError("Normal prefill transport requires separated EP8 experts")
+        if prefill == "directed":
+            if min_rows is not None:
+                raise ValueError(
+                    "A normal prefill minimum requires allgather or alltoall"
+                )
+        elif type(min_rows) is not int or min_rows < 1:
+            raise ValueError(
+                "Normal prefill requires an explicit positive minimum row count"
             )
 
     def validate(self):
@@ -3446,6 +3672,7 @@ class ServerArgs:
                 raise ValueError("NPU execution requires --disable-pdl")
 
         self.validate_petit_moe_options()
+        self.validate_directed_shared_options()
         self.validate_rank_emulation()
         self.validate_prefill_delay()
 
@@ -4496,6 +4723,32 @@ class ServerArgs:
             "of hot experts; the total must divide over the EP size.",
         )
         parser.add_argument(
+            "--moe-load-stat-interval",
+            type=int,
+            default=ServerArgs.moe_load_stat_interval,
+            help="Collect target and draft destination expert load every round; "
+            "all-gather statistics at this explicit interval. Requires the "
+            "synthetic physical router. Does not move expert weights.",
+        )
+        parser.add_argument(
+            "--moe-random-physical-rng",
+            choices=["philox4x32-10"],
+            default=ServerArgs.moe_random_physical_rng,
+            help="Synthetic MoE workload: directly sample distinct physical "
+            "experts and independent weights using this explicit RNG. Requires "
+            "Ascend V4.1 W4A4 with full-world DP/EP and TP1; omitted retains "
+            "learned routing. Does not represent model-quality inference.",
+        )
+        parser.add_argument(
+            "--draft-ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.draft_ep_num_redundant_experts,
+            help="Independent redundant slots per draft MoE layer. Omitted/0 "
+            "keeps the draft identity layout. Requires speculation, EP and an "
+            "explicit --ep-dispatch-algorithm; logical plus redundant experts "
+            "must divide over EP. Target placement files and EPLB do not apply.",
+        )
+        parser.add_argument(
             "--ep-dispatch-algorithm",
             type=str,
             default=ServerArgs.ep_dispatch_algorithm,
@@ -4608,10 +4861,20 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            choices=["none", "agrs", "deepep", "flashinfer", "gluon_petit"],
+            choices=[
+                "none",
+                "agrs",
+                "deepep",
+                "flashinfer",
+                "gluon_petit",
+                "ascend_mc2",
+                "ascend_directed",
+            ],
             help="MoE communication backend. agrs and flashinfer explicitly select "
             "the Kimi-K3 attention-DP transport; gluon_petit selects the fused "
-            "Petit MegaMoE transport; none preserves existing behavior.",
+            "Petit MegaMoE transport; ascend_mc2 selects Ascend hierarchy "
+            "Dispatch/Combine; ascend_directed selects EP8/EP32 source-owned INT4 "
+            "dispatch and route return; none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -4786,6 +5049,7 @@ class ServerArgs:
                 "triton_full",
                 "ascend_full",
                 "sonic",
+                "compact",
             ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
@@ -4882,6 +5146,12 @@ class ServerArgs:
                 "Sparse indexer prefill workspace cap (MiB) for the "
                 "softplus_sqrt logits buffer."
             ),
+        )
+        parser.add_argument(
+            "--engram-tp-size",
+            type=int,
+            default=ServerArgs.engram_tp_size,
+            help="Ascend V4.1 device table TP: attention TP by default, or the full world.",
         )
         parser.add_argument(
             "--engram-host-table",
@@ -5229,6 +5499,26 @@ class ServerArgs:
             "aggregate TP (including DCP) without DP, PP or PD disaggregation. "
             "'synthetic': benchmark-only forced acceptance; set by "
             "--synthetic-acceptance-length.",
+        )
+        parser.add_argument(
+            "--sampling-force-topk",
+            type=int,
+            help="Required for compact: candidate cap before temperature and nucleus filtering.",
+        )
+        parser.add_argument(
+            "--sampling-top-logprobs",
+            type=int,
+            help="Optional compact output: this many processed top logprobs on every prefill/decode row. Requires --enable-output-logprobs.",
+        )
+        parser.add_argument(
+            "--spec-reject-draft-prob-penalty",
+            type=float,
+            help="Required for compact: log-probability penalty applied only to rejection residuals.",
+        )
+        parser.add_argument(
+            "--spec-draft-confidence-temperature",
+            type=float,
+            help="Required for compact: sigmoid temperature of the DSpark confidence head.",
         )
         parser.add_argument(
             "--spec-reject-draft-prob-threshold",
@@ -5864,6 +6154,38 @@ class ServerArgs:
             "logprobs only, never the sampled tokens. Folded to blockwise by "
             "--numerics rl-bitwise, overriding an explicit torch; an explicit "
             "blockwise form and block width are preserved.",
+        )
+        parser.add_argument(
+            "--ascend-directed-shared-layout",
+            type=str,
+            choices=("replicated",),
+            help="Required for ascend_directed. replicated keeps complete shared weights on every rank, without shared-expert communication.",
+        )
+        parser.add_argument(
+            "--ascend-directed-schedule",
+            choices=("separated", "megamoe"),
+            help="Required for ascend_directed: select whole-batch separated kernels "
+            "or the bounded fused routed pipeline.",
+        )
+        parser.add_argument(
+            "--ascend-directed-prefill-transport",
+            choices=("directed", "allgather", "alltoall"),
+            help="Required for ascend_directed. Select prefill transport; decode "
+            "keeps the configured directed implementation. Normal collectives "
+            "require separated EP8 experts.",
+        )
+        parser.add_argument(
+            "--ascend-directed-prefill-min-rows",
+            type=int,
+            help="Required for normal prefill transport. Use normal collectives "
+            "when the largest source has at least this many rows; smaller "
+            "prefill batches retain directed transport.",
+        )
+        parser.add_argument(
+            "--ascend-directed-shared-precision",
+            choices=("bf16", "int8"),
+            help="Required for ascend_directed. INT8 uses dynamic-token W8A8 "
+            "shared projections with complete DP weight replication.",
         )
         parser.add_argument(
             "--moe-combine-order",

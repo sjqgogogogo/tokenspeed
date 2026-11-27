@@ -144,7 +144,9 @@ def _runtime_states(*, draft_probs: bool, trees: bool, history: bool) -> Runtime
         device="cpu",
     )
     if draft_probs:
-        states.init_draft_probs(spec_num_tokens=SPEC_TOKENS, reject_threshold=2.0)
+        states.init_draft_probs(
+            spec_num_tokens=SPEC_TOKENS, reject_threshold=2.0, candidate_cap=None
+        )
     if trees:
         states.init_draft_trees(SPEC_TOKENS)
         states.init_draft_tree_q(SPEC_TOKENS, num_slots=2, num_candidates=4)
@@ -999,3 +1001,12 @@ def test_gdn_pending_metadata_is_complete_and_snapshots_require_materialization(
     owner.records[3, 1] = 0
     with pytest.raises(RuntimeError, match="must be materialized"):
         layout.export(3, image, None, admission_id=1)
+
+
+def test_compact_runtime_proposals_restore_ids_and_probabilities():
+    states = _runtime_states(draft_probs=False, trees=False, history=True)
+    states.init_draft_probs(
+        spec_num_tokens=SPEC_TOKENS, reject_threshold=2.0, candidate_cap=5
+    )
+    _round_trip(states, src_slot=3, dst_slot=7)
+    _assert_slot_state_complete(states, exporter=states, slot_domains={POOL_ROWS})

@@ -27,6 +27,9 @@ from collections.abc import Mapping, Sequence
 import torch
 from tokenspeed_kernel.ops.metadata import apply_stop_conditions
 
+from tokenspeed.runtime.execution.draft_probabilities import (
+    allocate_draft_probabilities,
+)
 from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
 from tokenspeed.runtime.execution.slot_state import (
     pack_slot_rows,
@@ -121,6 +124,7 @@ class RuntimeStates:
         # The drafter's recorded proposal distributions
         # (--enable-speculative-sampling), see init_draft_probs.
         self.draft_probs: torch.Tensor | None = None
+        self.draft_token_ids: torch.Tensor | None = None
         self.draft_probs_sentinel: float = 0.0
         # Token id of draft_probs column 0: this rank's shard start when it holds its columns only.
         self.draft_probs_vocab_start: int = 0
@@ -156,11 +160,18 @@ class RuntimeStates:
         *,
         spec_num_tokens: int,
         reject_threshold: float,
+        candidate_cap: int | None,
         shard: tuple[int, int] | None = None,
     ) -> None:
         """Allocate the drafter's recorded proposal distributions.
 
-        ``draft_probs[slot, s]`` (fp32 ``[pool + 1, spec_num_tokens, vocab]``)
+        With candidate_cap=None, rows cover the complete vocabulary. An
+        explicit cap stores that many FP32 probabilities and matching INT32
+        draft_token_ids; omitted vocabulary IDs have probability zero. IDs
+        and probabilities share the request snapshot and stable graph lifetime.
+        Reset invalidates probabilities with the sentinel; stale IDs are ignored.
+
+        ``draft_probs[slot, s]`` (fp32 ``[pool + 1, spec_num_tokens, width]``)
         is the distribution the chain drafter sampled its step-``s`` token
         from, which the next round verifies as candidate column ``s + 1``.
         With ``shard`` (this rank's vocabulary shard: its first token id and
@@ -175,21 +186,19 @@ class RuntimeStates:
         probability reads as the sentinel, and small enough that ``+ 1.0``
         is representable in fp32). Returns None.
         """
-        if spec_num_tokens < 1:
-            raise ValueError(
-                f"draft_probs needs at least one verify column, got {spec_num_tokens}"
-            )
-        pool_size = self.valid_cache_lengths.shape[0]
-        self.draft_probs_sentinel = float(reject_threshold) + 1.0
-        vocab_start, columns = shard or (0, self.vocab_size)
-        self.draft_probs_vocab_start = vocab_start
-        self.draft_probs = torch.full(
-            (pool_size, spec_num_tokens, columns),
-            self.draft_probs_sentinel,
-            dtype=torch.float32,
+        allocation = allocate_draft_probabilities(
+            pool_size=self.valid_cache_lengths.shape[0],
+            spec_num_tokens=spec_num_tokens,
+            vocab_size=self.vocab_size,
+            reject_threshold=reject_threshold,
+            candidate_cap=candidate_cap,
+            shard=shard,
             device=self.device,
         )
-        self.draft_probs[:, -1, :] = 0.0
+        self.draft_probs = allocation.probabilities
+        self.draft_token_ids = allocation.token_ids
+        self.draft_probs_vocab_start = allocation.vocab_start
+        self.draft_probs_sentinel = allocation.sentinel
 
     def reset_draft_probs(self, pool_indices: torch.Tensor) -> None:
         """Mark ``pool_indices`` as having no recorded proposal.
@@ -420,6 +429,8 @@ class RuntimeStates:
         ]
         if self.draft_probs is not None:
             rows.append(self.draft_probs[slot])
+        if self.draft_token_ids is not None:
+            rows.append(self.draft_token_ids[slot])
         if self.future_parent_map is not None:
             rows.append(self.future_parent_map[slot])
         if self.future_draft_q is not None:

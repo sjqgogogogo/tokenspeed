@@ -1855,6 +1855,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
                 disaggregated: pd.is_some(),
                 lm_head_tp_under_dp: false,
                 computes_prompt_logprobs: pd.is_none_or(|pd| pd.role != Role::Decode),
+                fixed_top_logprobs: None,
             },
         },
         kv_total_pages,

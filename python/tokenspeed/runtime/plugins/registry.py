@@ -98,6 +98,8 @@ __all__ = [
     "register_config",
     "register_linear_attention_backend",
     "register_model",
+    "register_query_context_parallel_capability",
+    "query_context_parallel_capability",
     "register_numerics_envelope",
     "registered_architectures",
     "registered_model",
@@ -543,4 +545,44 @@ def register_cache_pool(
         factory,
         kind="cache pool",
         override=override,
+    )
+
+
+_QUERY_CONTEXT_PARALLEL_CAPABILITIES: dict[
+    str, tuple[frozenset[str], frozenset[str]]
+] = {}
+
+
+def register_query_context_parallel_capability(
+    backend: str,
+    *,
+    devices: frozenset[str],
+    roles: frozenset[str],
+    override: bool = False,
+) -> None:
+    """Declare a backend's supported query-shard devices and serving roles.
+
+    The planner and executor are shared. Aggregate serving shards pure extend
+    rounds only; its decode rounds keep replicated rows. Backend registration
+    must also implement that decode contract before admitting the aggregate role.
+    """
+    if not devices or not devices <= {"cuda", "npu"}:
+        raise ValueError("QCP devices must be cuda or npu")
+    if not roles or not roles <= {"prefill", "null"}:
+        raise ValueError("QCP roles must be prefill or null")
+    _put(
+        _QUERY_CONTEXT_PARALLEL_CAPABILITIES,
+        backend,
+        (devices, roles),
+        kind="query context parallel capability",
+        override=override,
+    )
+
+
+def query_context_parallel_capability(
+    backend: str | None,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Return the explicit declaration or the built-in GPU prefill contract."""
+    return _QUERY_CONTEXT_PARALLEL_CAPABILITIES.get(
+        backend, (frozenset({"cuda"}), frozenset({"prefill"}))
     )

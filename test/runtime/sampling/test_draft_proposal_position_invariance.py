@@ -78,7 +78,9 @@ def test_recorded_draft_chain_follows_the_committed_frontier(monkeypatch):
     )
     backend = FlashInferSamplingBackend(config)
     states = RuntimeStates(pool_size, vocab_size, vocab_size, width, device)
-    states.init_draft_probs(spec_num_tokens=width, reject_threshold=2.0)
+    states.init_draft_probs(
+        spec_num_tokens=width, reject_threshold=2.0, candidate_cap=None
+    )
     buffers = InputBuffers(max_bs, max_bs * width, pool_size, device)
     sampler = DraftProposalSampler(
         pools=backend.speculative_sampling_pools(),

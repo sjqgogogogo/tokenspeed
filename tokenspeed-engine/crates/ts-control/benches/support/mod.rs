@@ -212,6 +212,7 @@ pub fn limits(config: &Config) -> IngressLimits {
             disaggregated: false,
             lm_head_tp_under_dp: false,
             computes_prompt_logprobs: true,
+            fixed_top_logprobs: None,
         },
     }
 }

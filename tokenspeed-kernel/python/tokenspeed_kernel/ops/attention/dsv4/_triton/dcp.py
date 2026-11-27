@@ -73,7 +73,7 @@ def normalize_dcp_partials(
     """Normalize empty attention partials for the runtime DCP combine.
 
     Args:
-        output: FP16/BF16/FP32 CUDA partials [tokens, heads, dim], possibly
+        output: FP16/BF16/FP32 accelerator partials [tokens, heads, dim], possibly
             strided, updated in place only for empty selections. Nonempty
             values (including NaNs) are preserved.
         lse: Natural-log FP32 [tokens, heads], possibly strided.
@@ -97,8 +97,8 @@ def normalize_dcp_partials(
         or lse.dtype != torch.float32
     ):
         raise TypeError("DCP normalization requires floating partials and FP32 LSE")
-    if not output.is_cuda or lse.device != output.device:
-        raise ValueError("DCP normalization requires tensors on one CUDA device")
+    if output.device.type not in ("cuda", "npu") or lse.device != output.device:
+        raise ValueError("DCP normalization requires tensors on one accelerator device")
     for name, lengths in (("swa_lens", swa_lens), ("extra_lens", extra_lens)):
         if lengths is None and name == "extra_lens":
             continue
@@ -229,7 +229,7 @@ def dcp_weight_for_reduce_scatter(
     """Return FP32 head-major weighted O and TP-local global LSE for DCP AG+RS.
 
     Args:
-        output: Local no-sink O [tokens, gathered_heads, dim], on CUDA.
+        output: Local no-sink O [tokens, gathered_heads, dim], on an accelerator.
         all_lse: Gathered FP32 natural-log LSE [shards, tokens, gathered_heads].
         rank: Context rank and destination TP head slice within the DCP group.
 
@@ -243,11 +243,11 @@ def dcp_weight_for_reduce_scatter(
     if degree <= 0 or not 0 <= rank < degree or heads % degree:
         raise ValueError("DCP weight topology is invalid")
     if (
-        not output.is_cuda
+        output.device.type not in ("cuda", "npu")
         or all_lse.device != output.device
         or all_lse.dtype != torch.float32
     ):
-        raise ValueError("DCP weights require matching CUDA output and FP32 LSE")
+        raise ValueError("DCP weights require matching accelerator output and FP32 LSE")
     dim = output.shape[-1]
     weighted = torch.empty(
         (heads, tokens, dim), device=output.device, dtype=torch.float32
@@ -280,7 +280,7 @@ def dcp_weight_for_reduce_scatter(
 def dcp_apply_sink(
     output: torch.Tensor, lse: torch.Tensor, sink: torch.Tensor, *, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Scale CUDA no-sink O by one sink and cast directly to its output dtype.
+    """Scale accelerator no-sink O by one sink and cast to its output dtype.
 
     Args:
         output: FP32 O [tokens, TP-local heads, dim], possibly a transposed RS view.
@@ -298,12 +298,14 @@ def dcp_apply_sink(
     ):
         raise ValueError("DCP sink shapes disagree")
     if (
-        not output.is_cuda
+        output.device.type not in ("cuda", "npu")
         or lse.device != output.device
         or sink.device != output.device
         or not sink.is_contiguous()
     ):
-        raise ValueError("DCP sink tensors require one CUDA device and contiguous sink")
+        raise ValueError(
+            "DCP sink tensors require one accelerator device and contiguous sink"
+        )
     if lse.dtype != torch.float32 or dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("DCP sink requires FP32 LSE and 16-bit output")
     tokens, heads, dim = output.shape

@@ -763,7 +763,7 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 
     states = RuntimeStates(POOL, VOCAB, VOCAB, N, "cpu")
-    states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
+    states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0, candidate_cap=None)
     buffers = _draft_buffers()
     pools = SpeculativeSamplingPools(
         temperature=torch.tensor(temperatures, dtype=torch.float32),
@@ -1093,7 +1093,7 @@ def test_bind_refuses_greedy_drafters_and_arms_chain_drafters(monkeypatch):
     assert not BaseDrafter.supports_speculative_sampling
 
     states = RuntimeStates(POOL, VOCAB, VOCAB, N, "cpu")
-    states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
+    states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0, candidate_cap=None)
     buffers = _draft_buffers()
     pools = SpeculativeSamplingPools(
         temperature=torch.ones(POOL + 1),

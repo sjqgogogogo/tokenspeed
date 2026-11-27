@@ -72,6 +72,34 @@ class SpeculativeSamplingPools:
     seed: torch.Tensor  # int64 Philox seed
 
 
+@dataclass(frozen=True)
+class CompactSamplingConfig:
+    """Explicit fixed-candidate distribution and draft verification policy."""
+
+    force_topk: int
+    draft_prob_penalty: float
+    confidence_temperature: float
+    # None omits the optional alternatives output; otherwise every forward
+    # reports this fixed width, including captured decode.
+    top_logprobs: int | None = None
+
+    def __post_init__(self):
+        if self.force_topk < 1:
+            raise ValueError("force_topk must be positive")
+        if (
+            self.top_logprobs is not None
+            and not 1 <= self.top_logprobs <= self.force_topk
+        ):
+            raise ValueError("top_logprobs must fit within the forced candidate cap")
+        if not math.isfinite(self.draft_prob_penalty) or self.draft_prob_penalty < 0:
+            raise ValueError("draft_prob_penalty must be finite and non-negative")
+        if (
+            not math.isfinite(self.confidence_temperature)
+            or self.confidence_temperature <= 0
+        ):
+            raise ValueError("confidence_temperature must be finite and positive")
+
+
 @dataclass
 class SamplingBackendConfig:
     synthetic_acceptance_length: float | None
@@ -93,6 +121,8 @@ class SamplingBackendConfig:
 
     # Only ascend_full applies the optional top-p candidate truncation.
     npu_sampling_top_p_top_k_cap: bool = False
+    # Absent for other backends; compact requires all policy fields explicitly.
+    compact_sampling: CompactSamplingConfig | None = None
 
     enable_nan_detection: bool = False
 
@@ -150,6 +180,16 @@ class SamplingBackendConfig:
             raise ValueError("HF config npu_sampling_top_p_top_k_cap must be a boolean")
 
         return cls(
+            compact_sampling=(
+                CompactSamplingConfig(
+                    server_args.sampling_force_topk,
+                    server_args.spec_reject_draft_prob_penalty,
+                    server_args.spec_draft_confidence_temperature,
+                    server_args.sampling_top_logprobs,
+                )
+                if server_args.sampling_backend == "compact"
+                else None
+            ),
             synthetic_acceptance_length=server_args.synthetic_acceptance_length,
             sampling_stream=server_args.sampling_stream,
             logprob_order=server_args.logprob_order,

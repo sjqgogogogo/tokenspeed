@@ -25,11 +25,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from tokenspeed_kernel.ops.metadata import PrepTape, Reg
+from tokenspeed_kernel.ops.metadata.fill_tails import FillTailPlan
 from tokenspeed_kernel.ops.metadata.ngram import NGramHashParams, prepare_ngram_inputs
 
 from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -131,7 +132,7 @@ class InputBuffers:
         # Host-only: tokens of each extend row's chunk before its in-forward
         # State checkpoint, 0 for none.
         self.extend_state_checkpoint_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
-        self._pad_tape = self._record_pad_tape()
+        self._padding_plan = self._prepare_padding_plan()
 
     def prepare_request_token_history_inputs(
         self,
@@ -241,6 +242,8 @@ class InputBuffers:
         total_tokens: int,
         runtime_states: RuntimeStates,
         forward_op,
+        *,
+        query_shard: QueryShardPlan | None = None,
     ) -> None:
         """Assemble branch-local raw history before embedding-ID clamping.
 
@@ -275,13 +278,18 @@ class InputBuffers:
             raise ValueError("Engram snapshot has the wrong history width")
         # The untouched suffix starts clear and remains clear. On shrink, scrub
         # the preceding live range too, so every graph bucket sees dead padding.
-        refresh_tokens = max(total_tokens, self._ngram_active_tokens)
+        stale_end = self._ngram_active_tokens
+        if total_tokens < stale_end:
+            self.ngram_previous_tokens_buf[total_tokens:stale_end].fill_(-1)
+            self.ngram_token_mask_buf[total_tokens:stale_end].zero_()
+            self.ngram_hash_ids_buf[total_tokens:stale_end].copy_(
+                self.ngram_padding_hash
+            )
         if bs == 0:
-            self.ngram_previous_tokens_buf[:refresh_tokens].fill_(-1)
-            self.ngram_token_mask_buf[:refresh_tokens].zero_()
-            self.ngram_hash_ids_buf[:refresh_tokens].copy_(self.ngram_padding_hash)
             self._ngram_active_tokens = 0
             return
+        if query_shard is not None and query_shard.total_rows != total_tokens:
+            raise ValueError("Engram query shard must cover the packed input span")
 
         num_extends = forward_op.num_extends()
         overrides = forward_op.decode_input_ids
@@ -323,43 +331,33 @@ class InputBuffers:
             tail,
             needs_seed,
             self.input_ids_buf,
-            self.ngram_previous_tokens_buf[:refresh_tokens],
-            self.ngram_token_mask_buf[:refresh_tokens],
+            self.ngram_previous_tokens_buf[:total_tokens],
+            self.ngram_token_mask_buf[:total_tokens],
             self.ngram_prefix_buf[:bs],
-            self.ngram_hash_ids_buf[:refresh_tokens],
+            self.ngram_hash_ids_buf[:total_tokens],
             total_tokens,
             runtime_states.input_vocab_size,
             uniform_length,
             self.ngram_hash_params,
+            hash_row_ids=(None if query_shard is None else query_shard.local_row_ids),
         )
         self._ngram_active_tokens = total_tokens
 
-    def _record_pad_tape(self) -> "PrepTape | None":
-        """One launch for the whole padding-tail scrub.
-
-        The fills below are independent and touch persistent buffers, so a
-        tape records them once and replays them as a single kernel instead of
-        one launch each on every step's critical path. Non-CUDA callers keep
-        the torch spelling.
-        """
-        if torch.device(self.device).type != "cuda":
-            return None
-        tape = PrepTape(self.device)
-        tape.filltail(self.input_ids_buf, Reg.TOKENS, self.max_num_tokens, 1)
-        tape.filltail(self.positions_buf, Reg.TOKENS, self.max_num_tokens, 0)
-        for row in self.mrope_positions_buf:
-            tape.filltail(row, Reg.TOKENS, self.max_num_tokens, 0)
-        tape.filltail(self.input_lengths_buf, Reg.BS, self.max_num_tokens, 0)
-        tape.filltail(self.req_pool_indices_buf, Reg.BS, self.max_bs, 0)
-        tape.filltail(
-            self.state_write_req_pool_indices_buf,
-            Reg.BS,
-            self.max_bs,
-            self.state_write_padding_pool_index,
+    def _prepare_padding_plan(self) -> FillTailPlan:
+        """Bind persistent tails once; refresh lengths through the same path."""
+        return FillTailPlan(
+            (
+                self.input_ids_buf,
+                self.positions_buf,
+                *self.mrope_positions_buf,
+                self.input_lengths_buf,
+                self.req_pool_indices_buf,
+                self.state_write_req_pool_indices_buf,
+                self.seq_lens_buf,
+            ),
+            live_groups=(0, 0, 0, 0, 0, 1, 1, 1, 1),
+            values=(1, 0, 0, 0, 0, 0, 0, self.state_write_padding_pool_index, 1),
         )
-        tape.filltail(self.seq_lens_buf, Reg.BS, self.max_bs, 1)
-        tape.finalize()
-        return tape
 
     def _bulk_pinned(self, *specs):
         """One pinned allocation for this step, sliced per (numel, dtype).
@@ -580,20 +578,7 @@ class InputBuffers:
         # req_pool=0, positions=0) are not enough on their own once a larger
         # iter has overwritten the tail, so scrub it back here (cheap
         # tail-only fills; the active prefix was written above).
-        if self._pad_tape is not None:
-            self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
-        else:
-            if total_tokens < self.max_num_tokens:
-                self.input_ids_buf[total_tokens:].fill_(1)
-                self.positions_buf[total_tokens:].fill_(0)
-                self.mrope_positions_buf[:, total_tokens:].zero_()
-            if batch_size < self.max_bs:
-                self.req_pool_indices_buf[batch_size:].fill_(0)
-                self.state_write_req_pool_indices_buf[batch_size:].fill_(
-                    self.state_write_padding_pool_index
-                )
-                self.seq_lens_buf[batch_size:].fill_(1)
-            self.input_lengths_buf[batch_size:].zero_()
+        self._padding_plan.run((total_tokens, batch_size))
         return decode_input_ids
 
     @nvtx_range("input_prep_load", color="cyan")
@@ -605,6 +590,7 @@ class InputBuffers:
         decode_input_ids: list[int] | None,
         *,
         ngram_inputs: NGramInputs | None,
+        query_shard: QueryShardPlan | None = None,
     ) -> None:
         """The inputs the previous draft round writes (decode ids, n-gram
         inputs), after ``fill_input_buffers`` and once that round completes."""
@@ -746,7 +732,13 @@ class InputBuffers:
         # sampled token), and every id the drafters consume is sampled or
         # substituted in-vocab by construction.
         vocab_size = runtime_states.input_vocab_size
-        self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
+        self.fill_ngram_inputs(
+            ngram_inputs,
+            total_tokens,
+            runtime_states,
+            forward_op,
+            query_shard=query_shard,
+        )
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 
     def fill_dummy_decode_buffers(self, batch_size: int, total_tokens: int):

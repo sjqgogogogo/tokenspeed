@@ -2400,6 +2400,16 @@ memory use and performance in addition to kernel correctness.
 
 ## Query context parallelism
 
+The built-in GPU contract below serves the PD prefill role. A registered
+attention backend may declare additional devices and the aggregate role via
+`register_query_context_parallel_capability`. This is an admission capability,
+not a second executor: `QueryShardPlan.for_execution` constructs the same
+explicit row mapping for pure extends, returns no shard for pure decode, and
+rejects mixed extend/decode rounds. Aggregate KVP still requires matching DCP.
+A backend must preserve a common global-request collective schedule even when
+zigzag owners have different numbers of local contiguous query runs.
+
+
 `--query-context-parallel-size N` (`mapping.attn.qcp_*`, `N ==
 attn.tp_size == attn.kvp_size`) shards every extend forward of a PD prefill
 engine over the attention TP group, over the pages `--kv-parallel-size N`
@@ -3036,3 +3046,23 @@ to select replay for writeback. The pinned slot
 uploads remain alive through the completion event. All metadata stages,
 including acceptance and exit operations outside target capture, are warmed
 before serving. Pipeline-parallel execution commits immediately.
+
+## Proposal representation and output completion
+
+Recorded proposal distributions remain request-slot state. Dense rows use
+implicit token IDs, vocabulary shards declare their first token, and compact
+candidate rows pair probabilities with explicit IDs. Both tensors of a compact
+proposal are exported/restored together by `RuntimeStates`; no backend may
+interpret compact columns as vocabulary positions. Compact and vocabulary
+sharding cannot be combined. The invalid sentinel is above the rejection
+threshold, and the bonus-token column has no recorded proposal.
+
+A model may bind prepared communication resources to the serving stream
+through `ModelRunner.prepare_graph_capture` before final capture. It does not
+create a model-specific scheduling loop. On Ascend, each pending result leases
+an output-copy stream and retains its sources until host completion. Discarded
+results retire their leases until the copy finishes. Completion synchronizes
+only that result's stream, never a producer that may carry later collectives.
+Configured sampled-token alternatives follow the output-token row layout,
+including the complete captured verify window; trimming acceptance also trims
+the alternatives. Prompt logprobs remain eager-only.

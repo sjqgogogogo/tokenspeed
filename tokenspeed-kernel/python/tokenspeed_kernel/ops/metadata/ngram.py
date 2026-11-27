@@ -349,6 +349,8 @@ def prepare_ngram_inputs(
     vocab_size: int,
     uniform_length: int,
     hash_params: NGramHashParams,
+    *,
+    hash_row_ids: torch.Tensor | None = None,
 ) -> None:
     """Resolve raw lookbacks, token masks and hashes in one read-only state pass.
 
@@ -361,8 +363,53 @@ def prepare_ngram_inputs(
     ``previous`` [capacity,3], ``token_mask`` [capacity] and ``hashes``
     [capacity,layers,3*heads] are caller-owned stable outputs. Rows after
     ``total`` are dead padding. Uniform positive request length selects direct
-    indexing; zero selects ragged indexing. All modes use this same operation.
+    indexing; zero selects ragged indexing. ``hash_row_ids`` optionally names
+    the live hash rows the consumer needs, using global packed indices. Providers
+    may compute additional hashes; the Ascend provider computes only these rows.
+    Commit metadata always covers the entire input. All modes use this operation.
     """
+    if ids.device.type == "npu":
+        from tokenspeed_kernel.selection import select_kernel
+        from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+        rows = (
+            torch.arange(total, dtype=torch.int64, device=ids.device)
+            if hash_row_ids is None
+            else hash_row_ids
+        )
+        kernel = select_kernel(
+            "metadata",
+            "prepare_ngram_inputs",
+            format_signature(ids=dense_tensor_format(ids.dtype)),
+        )
+        return kernel(
+            snapshots,
+            positions,
+            reset,
+            slots,
+            cache_lengths,
+            request_ends,
+            tail,
+            needs_seed,
+            ids,
+            previous,
+            token_mask,
+            prefix,
+            hashes,
+            total,
+            vocab_size,
+            uniform_length,
+            hash_params,
+            hash_row_ids=rows,
+        )
+    if hash_row_ids is not None and (
+        hash_row_ids.ndim != 1
+        or hash_row_ids.dtype != torch.int64
+        or hash_row_ids.device != ids.device
+    ):
+        raise ValueError(
+            "Required Engram hash rows must be an int64 vector on the input device"
+        )
     bs = slots.numel()
     if not ids.is_cuda:
         seed = reset.bool() | needs_seed[slots]
@@ -527,6 +574,29 @@ def commit_ngram_inputs(
     prefix. Padding writes nothing. Preparation's ``prefix``/``previous``/mask
     must remain alive through commit, including after embedding IDs are clamped.
     """
+    if ids.device.type == "npu":
+        from tokenspeed_kernel.selection import select_kernel
+        from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+        kernel = select_kernel(
+            "metadata",
+            "commit_ngram_inputs",
+            format_signature(ids=dense_tensor_format(ids.dtype)),
+        )
+        return kernel(
+            slots,
+            lengths,
+            accepted,
+            ids,
+            previous,
+            token_mask,
+            prefix,
+            tail,
+            needs_seed,
+            cache_lengths,
+            num_extends,
+            padding_slot,
+        )
     bs = slots.numel()
     if not ids.is_cuda:
         rows = torch.arange(bs, device=slots.device)

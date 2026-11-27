@@ -50,6 +50,7 @@ class LogprobServability:
     pipeline_parallel: bool
     disaggregated: bool
     vocab_size: int
+    fixed_top_logprobs: int | None = None
 
     @classmethod
     def of(
@@ -65,4 +66,9 @@ class LogprobServability:
             ),
             disaggregated=server_args.disaggregation_mode != "null",
             vocab_size=vocab_size,
+            fixed_top_logprobs=(
+                (server_args.sampling_top_logprobs or 0)
+                if server_args.sampling_backend == "compact"
+                else None
+            ),
         )

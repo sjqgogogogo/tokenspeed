@@ -1484,6 +1484,14 @@ def _capture_serving_graphs(
     from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
     from tokenspeed.runtime.utils import set_random_seed
 
+    step = executor.forward_step
+    with step.device_module.stream(step.stream):
+        executor.model_runner.prepare_graph_capture()
+        if (
+            executor.drafter is not None
+            and executor.drafter.draft_model_runner is not None
+        ):
+            executor.drafter.draft_model_runner.prepare_graph_capture()
     executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     if executor.drafter is not None:
         with startup_phase("drafter.profile"):

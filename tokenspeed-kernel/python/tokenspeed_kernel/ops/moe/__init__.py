@@ -2564,3 +2564,16 @@ from tokenspeed_kernel.ops.moe.native import (
 )  # noqa: E402
 
 # isort: on
+
+
+def bind_moe_local_expert_counts(plan: dict, counts: torch.Tensor) -> None:
+    """Bind a destination-local int32 expert counter through the selected provider.
+
+    ``counts`` holds one element per physical expert owned by this rank. The
+    provider accumulates live dispatched routes; graph padding contributes zero.
+    Call once before graph capture. Unsupported providers raise.
+    """
+    bind = plan.get("bind_local_expert_counts")
+    if bind is None:
+        raise ValueError("Selected MoE provider does not expose local expert counts")
+    bind(counts)

@@ -193,6 +193,7 @@ class _CPUInputGraph(PrefillGraph):
             prefill_graph_max_tokens=4,
             prefill_graph_capture_sizes=[4],
             acl_graph_memory_policy="discard",
+            moe_load_stat_interval=None,
         )
         runner = _CPURunner(model, _RunnerConfig(False), True, False)
         super().__init__(

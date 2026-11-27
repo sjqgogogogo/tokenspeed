@@ -69,7 +69,7 @@ def test_draft_probs_start_as_sentinel_with_a_zero_bonus_slot():
     # reset_draft_probs is a no-op until the buffer exists.
     states.reset_draft_probs(torch.tensor([1], dtype=torch.int64))
 
-    states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0)
+    states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0, candidate_cap=None)
     probs = states.draft_probs
     assert probs.shape == (5, 3, 32) and probs.dtype == torch.float32
     assert states.draft_probs_sentinel == 3.0
@@ -96,7 +96,7 @@ def test_draft_tree_parents_are_declared_at_construction():
 
 def _recorded_states() -> RuntimeStates:
     states = RuntimeStates(4, 32, 32, 3, "cpu")
-    states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0)
+    states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0, candidate_cap=None)
     # Pretend the drafter recorded every slot's two steps.
     states.draft_probs[:, :-1] = 0.25
     return states

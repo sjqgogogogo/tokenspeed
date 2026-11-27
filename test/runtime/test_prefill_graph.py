@@ -168,7 +168,7 @@ class TestPrefillCaptureArgsTest:
             enable_dp_local_cuda_graph=False,
         )
         with pytest.raises((TypeError), match=("prefill_graph_capture_batch_sizes")):
-            ModelExecutorConfig(**config_args)
+            ModelExecutorConfig(**config_args, moe_load_stat_interval=None)
 
         # Unset captures 4 requests, never more than max_num_seqs.
         for sizes, max_num_seqs, expected in (
@@ -180,6 +180,7 @@ class TestPrefillCaptureArgsTest:
                 config = ModelExecutorConfig(
                     **{**config_args, "max_num_seqs": max_num_seqs},
                     prefill_graph_capture_batch_sizes=sizes,
+                    moe_load_stat_interval=None,
                 )
                 assert (config.prefill_graph_capture_batch_sizes) is (sizes)
                 assert (resolve_prefill_capture_batch_sizes(config, 1024)) == (expected)

@@ -26,6 +26,9 @@ import logging
 from dataclasses import dataclass
 
 import torch
+
+# DCP has no registry family for these shared portable weighting/sink helpers;
+# runtime retains ownership of the collectives around them.
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     combine_dcp_attention_partials,
     dcp_apply_sink,
@@ -360,8 +363,8 @@ def combine_attention_partials(
             weights and sums them in FP32. ``True`` is the head-replicated form
             (a layer holding every head, as under query context parallelism): every
             rank attended all heads over its own pages and the weighted
-            partials are all-reduced, so every rank returns every head; no
-            sink yet. Both forms split heads by the group's degree, so
+            partials are all-reduced, so every rank returns every head and
+            applies its optional sink after the sum. Both forms split heads by the group's degree, so
             ``heads % len(group) == 0`` holds
             for either.
         lend_records: Pack the head-sharded form's records into the group's
@@ -380,10 +383,9 @@ def combine_attention_partials(
         raise ValueError("DCP combine topology does not partition query heads")
     if local_lse.shape != local_output.shape[:-1]:
         raise ValueError("DCP combine output and LSE shapes disagree")
-    if keep_all_heads and sink is not None:
-        raise ValueError("the head-replicated DCP combine takes no sink")
     heads = local_output.shape[1] // degree
-    if sink is not None and sink.numel() < heads:
+    sink_heads = local_output.shape[1] if keep_all_heads else heads
+    if sink is not None and sink.numel() < sink_heads:
         raise ValueError("DCP sink must cover the TP-local heads")
     if (
         not keep_all_heads
@@ -420,12 +422,13 @@ def combine_attention_partials(
     if keep_all_heads:
         # Every head's partial is weighted; the sum over owners is the full
         # attention of every head on every rank.
-        return (
-            all_reduce(weighted, group)
-            .movedim(0, 1)
-            .to(dtype=local_output.dtype, memory_format=torch.contiguous_format)
-            .contiguous()
-        )
+        output = all_reduce(weighted, group).movedim(0, 1)
+        if sink is not None:
+            full_lse = torch.logsumexp(gathered_lse, dim=0)
+            return dcp_apply_sink(output, full_lse, sink, dtype=local_output.dtype)
+        return output.to(
+            dtype=local_output.dtype, memory_format=torch.contiguous_format
+        ).contiguous()
     output = reduce_scatter(weighted, group).movedim(0, 1)
     if sink is None:
         # Request token-major storage during the cast to avoid copying twice.

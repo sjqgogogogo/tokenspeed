@@ -122,6 +122,7 @@ class BaseDrafter:
     # Other block drafters propose a whole block greedily and leave this False.
     supports_speculative_sampling = False
     supports_dp_local_graph: bool = False
+    expert_load_round_in_forward: bool = False
 
     # Whether the recorded q is DFlash2's sparse ``RuntimeStates.future_draft_q``
     # instead of the dense ``RuntimeStates.draft_probs`` rows.
@@ -314,6 +315,11 @@ class BaseDrafter:
             target_model: The target ``torch.nn.Module`` the drafter
                 speculates for.
         """
+
+    def prepare_target_verify(
+        self, ctx: ForwardContext, logits_output: LogitsProcessorOutput
+    ) -> None:
+        """Schedule independent draft work once the target captures are ready."""
 
     def prepare_target_forward(self, ctx: ForwardContext) -> None:
         """Hook before the round's target forward.

@@ -1872,3 +1872,13 @@ remaining replay ahead of later plans. The control plane tracks retirement
 fences separately from scheduler cache operations. Peer export, cache clear
 and drain wait for replica completion, including releases queued after the
 last forward's results.
+
+## Fixed-capacity sampled-token alternatives
+
+An ingress may admit decode top-logprobs only when the sampler declares a
+startup-fixed alternative capacity. The output processor consumes alternatives
+in the same row layout as output tokens, including each decode request's full
+verify window, and retains only accepted rows through the stop cutoff. Missing
+or undersized alternatives terminate the request rather than returning partial
+positions. A filtering sampler reports its processed distribution; the executor
+must not replace it with alternatives from raw logits.

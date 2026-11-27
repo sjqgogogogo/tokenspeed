@@ -77,11 +77,14 @@ class SamplingBatchInfo:
     valid_cache_lengths: torch.Tensor | None = None
     extend_lengths: torch.Tensor | None = None
 
-    # fp32[pool_rows, N, vocab] — RuntimeStates.draft_probs, read-only
+    # fp32[pool_rows, N, width] — RuntimeStates.draft_probs, read-only
     # reference, present only under --enable-speculative-sampling. Verify
     # gathers its rows by `req_pool_indices` inside the captured graph and
     # runs the draft-prob accept rule; None selects the target-only rule.
     draft_probs: torch.Tensor | None = None
+    # INT32 IDs matching compact draft_probs; None means dense vocabulary rows.
+    # Borrow the whole pool, including when slicing a batch.
+    draft_token_ids: torch.Tensor | None = None
 
     # RuntimeStates.future_draft_q, read-only reference: the sparse draft q
     # the DFlash2 walk records per pool slot under --enable-speculative-sampling

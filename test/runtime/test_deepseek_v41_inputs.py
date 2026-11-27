@@ -1408,7 +1408,9 @@ def test_input_only_tokens_survive_prefill_decode_and_ngram_preparation(buffers)
     op = _op(states, ["a"], [2], [1], [], [], [-1])
     _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
     assert ib.input_ids_buf[0].item() == 100
-    runtime.init_draft_probs(spec_num_tokens=2, reject_threshold=2.0)
+    runtime.init_draft_probs(
+        spec_num_tokens=2, reject_threshold=2.0, candidate_cap=None
+    )
     assert runtime.draft_probs.shape == (6, 2, 64)
 
 
